@@ -17,6 +17,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
+.env
 
 # Logs and caches
 *.log
@@ -35,3 +36,4 @@ Thumbs.db
 
 # Tooling
 .ipynb_checkpoints/
+.env
