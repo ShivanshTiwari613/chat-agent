@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import json
 from typing import Any, AsyncGenerator, List, Dict, Union
 
 # Standard LangChain and Google GenAI imports
@@ -26,20 +27,13 @@ from config.settings import settings
 class AgentEngine:
     """
     The main orchestrator for a single agent session.
-    Manages the LLM, the Tools (Web, Code, RAG, Code-Mapping), 
-    and the E2B Sandbox lifecycle.
     """
 
     def __init__(self, plan_id: str):
         self.plan_id = plan_id
-
-        # 1. Initialize the Sandbox Handler
         self.sandbox_handler = E2BSandbox(plan_id=plan_id, timeout=1800)
-
-        # 2. Initialize the Ephemeral RAG Index (with Tree-Sitter support)
         self.file_index = EphemeralFileIndex()
 
-        # 3. Initialize the LLM (Gemini 2.0)
         self.llm = ChatGoogleGenerativeAI(
             model=settings.GEMINI_MODEL_NAME,
             temperature=0,
@@ -56,13 +50,7 @@ class AgentEngine:
         self.agent_executor: AgentExecutor | None = None
 
     async def add_files(self, file_paths: List[str]):
-        """
-        Differentiates and ingests files into three possible paths:
-        1. Data files (CSV/XLSX) -> Uploaded to E2B Sandbox for Python execution.
-        2. Code files (PY/JS/TS) -> Processed via Tree-Sitter for structural mapping.
-        3. All text files (PDF/DOCX/PY) -> Indexed in RAM via Hybrid RAG (BM25 + FAISS).
-        """
-        logger.info(f"[{self.plan_id}] Ingesting {len(file_paths)} files into the intelligence engine...")
+        logger.info(f"[{self.plan_id}] Ingesting {len(file_paths)} files...")
         
         for path in file_paths:
             if not os.path.exists(path):
@@ -70,60 +58,53 @@ class AgentEngine:
                 continue
 
             filename = os.path.basename(path)
-            ext = os.path.splitext(path)[1].lower()
+            base_name, ext = os.path.splitext(filename)
+            ext = ext.lower()
 
-            # --- PATH 1: DATA ANALYSIS (Sandbox) ---
+            # Path 1: Data Files (CSV/Excel)
             if ext in [".csv", ".xlsx", ".xls", ".json"]:
                 await self.sandbox_handler.ensure_running()
                 try:
                     with open(path, "rb") as f:
                         content = f.read()
                         sb = self.sandbox_handler.sandbox
-                        if not sb:
-                            logger.error("Sandbox not available; skipping upload.")
-                            continue
-                        await asyncio.to_thread(sb.files.write, filename, content)
-                    logger.info(f"Uploaded {filename} to Sandbox for data analysis.")
+                        if sb:
+                            await asyncio.to_thread(sb.files.write, filename, content)
+                            logger.info(f"Uploaded {filename} to Sandbox.")
                 except Exception as e:
                     logger.error(f"Failed to upload {filename} to sandbox: {e}")
 
-            # --- PATH 2 & 3: RAG & CODE MAPPING ---
+            # Path 2 & 3: RAG & Precision Search Support
             try:
-                # Extract text content
                 text_content = await asyncio.to_thread(FileProcessor.extract_content, path)
-                
                 if text_content:
-                    # If it's code, build the structural map (Skeleton)
                     if ext in [".py", ".js", ".ts", ".go", ".java", ".cpp", ".c"]:
                         self.file_index.add_code_structure(filename, text_content)
-                        logger.info(f"Created structural map for {filename} using Tree-Sitter.")
 
-                    # Add to standard RAG chunks
                     self.file_index.add_text(text_content, filename)
-                    logger.info(f"Indexed {filename} into Hybrid RAG.")
+
+                    # Save extracted text to Sandbox for "Precision Search Protocol"
+                    await self.sandbox_handler.ensure_running()
+                    sb = self.sandbox_handler.sandbox
+                    if sb:
+                        sandbox_txt_name = f"{base_name}.txt"
+                        await asyncio.to_thread(sb.files.write, sandbox_txt_name, text_content)
+                        logger.info(f"Saved {sandbox_txt_name} for precision searching.")
+
             except Exception as e:
                 logger.error(f"Failed to process {filename}: {e}")
 
-        # Finalize indices (Compute Embeddings and BM25 Scores)
         if self.file_index.chunks:
-            logger.info(f"[{self.plan_id}] Finalizing Hybrid RAG search indices...")
             await asyncio.to_thread(self.file_index.finalize)
 
     async def initialize(self):
-        """
-        Async initialization: Starts sandbox and builds the agent chain.
-        """
         logger.info(f"[{self.plan_id}] Initializing Agent Engine Chain...")
-
-        # Ensure E2B Sandbox is alive
         await self.sandbox_handler.start()
 
-        # Instantiate logic for tools
         search_logic = SearchingTool(sandbox_handler=self.sandbox_handler)
         coding_logic = CodingTool(sandbox_handler=self.sandbox_handler)
         file_logic = FileIntelligenceTool(index=self.file_index)
 
-        # Build StructuredTools
         tools = [
             StructuredTool.from_function(
                 coroutine=search_logic.execute,
@@ -145,7 +126,6 @@ class AgentEngine:
             ),
         ]
 
-        # Construct Agent with Contextual Prompt
         prompt = get_agent_prompt()
         agent = create_tool_calling_agent(self.llm, tools, prompt)
 
@@ -157,18 +137,33 @@ class AgentEngine:
             handle_parsing_errors=True,
             max_iterations=15,
         )
-        logger.info(f"[{self.plan_id}] Agent Engine fully initialized and tools registered.")
 
     def _normalize_output(self, value: Any) -> str:
         """
-        Cleans Gemini 2.0 responses. 
-        Strips internal JSON metadata ('extras', 'signature', 'index') 
-        that often leaks during streaming.
+        Extracts clean text from Gemini 2.0 output, handling potential dict/list structures
+        and stripping internal metadata markers.
         """
         if not value:
             return ""
 
-        # Handle list of parts
+        # If it's already a clean string, just strip minor metadata leftovers
+        if isinstance(value, str):
+            # Attempt to parse as JSON if it looks like a Gemini dict-string
+            if value.startswith("{") and "text" in value:
+                try:
+                    data = json.loads(value.replace("'", '"')) # Simple fix for single quotes
+                    if isinstance(data, dict):
+                        return data.get("text", value)
+                except:
+                    pass
+            
+            # Fallback to regex cleaning if JSON parsing fails
+            clean = re.sub(r"'extras':\s*\{.*?\}(,\s*)?", "", value, flags=re.DOTALL)
+            clean = re.sub(r"'signature':\s*'.*?'(,\s*)?", "", clean, flags=re.DOTALL)
+            clean = re.sub(r"'index':\s*\d+(,\s*)?", "", clean, flags=re.DOTALL)
+            return clean.strip("{}[]' \n")
+
+        # Handle List of parts (often seen in Gemini streaming)
         if isinstance(value, list):
             parts = []
             for item in value:
@@ -176,30 +171,29 @@ class AgentEngine:
                     parts.append(item.get("text", ""))
                 else:
                     parts.append(str(item))
-            final_text = "".join(parts)
-        elif isinstance(value, dict):
-            final_text = value.get("text", str(value))
-        else:
-            final_text = str(value)
+            return "".join(parts).strip()
 
-        # Regex to strip common Gemini 2.0 metadata leaks
-        final_text = re.sub(r"'extras':\s*\{.*?\}(,\s*)?", "", final_text, flags=re.DOTALL)
-        final_text = re.sub(r"'signature':\s*'.*?'(,\s*)?", "", final_text, flags=re.DOTALL)
-        final_text = re.sub(r"'index':\s*\d+(,\s*)?", "", final_text, flags=re.DOTALL)
-        
-        # Clean up leftover curly braces or list wrappers
-        final_text = final_text.replace("{'type': 'text', 'text':", "").replace("}]", "").replace("[{", "")
-        
-        return final_text.strip()
+        # Handle single dictionary
+        if isinstance(value, dict):
+            return value.get("text", str(value)).strip()
+
+        return str(value).strip()
 
     async def chat(
         self, user_input: str, chat_history: List[BaseMessage] = []
     ) -> AsyncGenerator[AgentEvent, None]:
-        """
-        Process a user message and stream back status events and the final answer.
-        """
         if not self.agent_executor:
-            raise RuntimeError("Agent not initialized. Call .initialize() first.")
+            raise RuntimeError("Agent not initialized.")
+
+        # --- SESSION STATE INJECTION ---
+        # Get unique filenames from the index
+        indexed_files = list(set(m['source'] for m in self.file_index.chunk_metadata))
+        file_context = ""
+        if indexed_files:
+            file_context = f"\n\n[SESSION CONTEXT: The following files are currently indexed and available in your sandbox as .txt files: {', '.join(indexed_files)}]"
+
+        # Combine user input with context to ensure the agent never "forgets" what it has
+        contextual_input = f"{user_input}{file_context}"
 
         yield AgentEvent(type="status", label="START", details="Agent thinking...")
 
@@ -208,31 +202,27 @@ class AgentEngine:
 
         try:
             async for chunk in self.agent_executor.astream(
-                {"input": user_input, "chat_history": chat_history}
+                {"input": contextual_input, "chat_history": chat_history}
             ):
-                # 1. Action Identification
                 if "actions" in chunk:
                     for action in chunk["actions"]:
                         saw_tool_call = True
                         tool_name = getattr(action, "tool", "tool")
                         yield AgentEvent(type="tool", label="TOOL_CALL", details=f"Agent using {tool_name}...")
 
-                # 2. Observation Capture
                 elif "steps" in chunk:
                     for action_obj, _ in chunk["steps"]:
                         tool_name = getattr(action_obj, "tool", "tool")
                         yield AgentEvent(type="observation", label="TOOL_RESULT", details=f"Finished {tool_name}.")
                 
-                # 3. Final Answer Processing
                 elif "output" in chunk:
                     final_output_captured = self._normalize_output(chunk["output"])
                     if final_output_captured:
                         yield AgentEvent(type="result", label="ANSWER", details=final_output_captured)
 
-            # Fallback for complex reasoning chains where output isn't in final chunk
             if not final_output_captured and not saw_tool_call:
                 result = await self.agent_executor.ainvoke(
-                    {"input": user_input, "chat_history": chat_history}
+                    {"input": contextual_input, "chat_history": chat_history}
                 )
                 final_output_captured = self._normalize_output(result.get("output", ""))
                 if final_output_captured:
@@ -243,9 +233,5 @@ class AgentEngine:
             yield AgentEvent(type="error", label="ERROR", details=str(e))
 
     async def cleanup(self):
-        """
-        Clean up resources: shuts down the sandbox.
-        """
-        logger.info(f"[{self.plan_id}] Cleaning up Agent Engine session...")
         if self.sandbox_handler:
             self.sandbox_handler.close()

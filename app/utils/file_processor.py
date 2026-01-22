@@ -15,7 +15,7 @@ from app.utils.logger import logger
 class EphemeralFileIndex:
     def __init__(self):
         # Local, lightweight encoder
-        self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
+        self.encoder = SentenceTransformer('all-mpnet-base-v2')
         self.chunks: List[str] = []
         self.chunk_metadata: List[Dict[str, Any]] = []
         self.code_map: Dict[str, List[str]] = {} # Filename -> List of function/class signatures
@@ -26,7 +26,6 @@ class EphemeralFileIndex:
     def add_code_structure(self, filename: str, content: str):
         """
         Uses Tree-Sitter to map out the 'skeleton' of code files.
-        Updated to support tree-sitter 0.21.0+ API.
         """
         ext = os.path.splitext(filename)[1].lower()
         lang_map = {
@@ -48,7 +47,6 @@ class EphemeralFileIndex:
             parser = get_parser(language_name)
             tree = parser.parse(bytes(content, "utf8"))
             
-            # Language-specific queries to avoid invalid node types.
             query_map = {
                 "python": """
                     (function_definition name: (identifier) @func_name)
@@ -87,21 +85,15 @@ class EphemeralFileIndex:
             if not query_str:
                 return
 
-            # Correct version-agnostic way to initialize a Query
             query = language.query(query_str)
             captures = query.captures(tree.root_node)
             
             signatures = []
-            # In newer tree-sitter, captures can return a dict or a list of tuples
-            # We handle the most common result format
             capture_items = captures.items() if isinstance(captures, dict) else captures
             for node, tag in capture_items:
-                # Extract the source text for the specific node (e.g., the function name or header)
                 start = node.start_byte
                 end = node.end_byte
                 node_text = content[start:end]
-                
-                # We want to capture the line of the definition for context
                 line_content = node_text.split('\n')[0]
                 signatures.append(f"{tag.replace('_', ' ').upper()}: {line_content}")
             
@@ -110,22 +102,34 @@ class EphemeralFileIndex:
                 logger.info(f"Successfully mapped {len(signatures)} symbols in {filename}")
 
         except Exception as e:
-            # Fallback for version-specific constructor issues
             logger.warning(f"Tree-sitter parse error for {filename}: {e}")
-            # If the complex query fails, we still have the file in the RAG index anyway
 
     def add_text(self, text: str, source_name: str):
+        """
+        Splits text into chunks with a sliding window (overlap) to preserve context.
+        """
         if not text: return
         
-        # Standard cleaning
         text = text.replace('\x00', '') # Remove null bytes
-        
         words = text.split()
-        chunk_size = 400 
-        for i in range(0, len(words), chunk_size):
+        
+        chunk_size = 600  # Words per chunk
+        overlap = 150     # Overlap to prevent splitting sentences/logic
+        
+        if len(words) <= chunk_size:
+            self.chunks.append(text)
+            self.chunk_metadata.append({"source": source_name, "chunk_idx": 0})
+            return
+
+        chunk_count = 0
+        for i in range(0, len(words), chunk_size - overlap):
             chunk = " ".join(words[i : i + chunk_size])
             self.chunks.append(chunk)
-            self.chunk_metadata.append({"source": source_name, "start_word": i})
+            self.chunk_metadata.append({"source": source_name, "chunk_idx": chunk_count})
+            chunk_count += 1
+            # Break if we've reached the end of the text
+            if i + chunk_size >= len(words):
+                break
 
     def finalize(self):
         """Builds the search indices."""
@@ -153,14 +157,16 @@ class EphemeralFileIndex:
         output = ["CODEBASE STRUCTURE MAP:"]
         for file, sigs in self.code_map.items():
             output.append(f"\nFILE: {file}")
-            # Limit to top 20 symbols per file to avoid context bloat
             for s in sigs[:20]:
                 output.append(f"  - {s}")
             if len(sigs) > 20:
                 output.append(f"  ... and {len(sigs)-20} more symbols.")
         return "\n".join(output)
 
-    def search(self, query: str, top_k: int = 5) -> List[str]:
+    def search(self, query: str, top_k: int = 8) -> List[str]:
+        """
+        Performs hybrid search. Increased top_k to provide more context to the LLM.
+        """
         if not self.chunks or self.vector_index is None or self.bm25 is None:
             return []
 
@@ -173,13 +179,17 @@ class EphemeralFileIndex:
         bm25_scores = self.bm25.get_scores(tokenized_query)
         b_indices = np.argsort(bm25_scores)[-top_k:][::-1]
 
-        # Hybrid Consensus
+        # Hybrid Consensus (Union of both search methods)
         combined_indices = list(set(v_indices[0].tolist()) | set(b_indices.tolist()))
         
+        # Sort indices to maintain some document order if chunks are adjacent
+        combined_indices.sort()
+
         results: List[str] = []
         for idx in combined_indices:
             if idx != -1 and idx < len(self.chunks):
-                results.append(f"FROM {self.chunk_metadata[idx]['source']}:\n{self.chunks[idx]}")
+                meta = self.chunk_metadata[idx]
+                results.append(f"[Source: {meta['source']} | Chunk: {meta['chunk_idx']}]:\n{self.chunks[idx]}")
         
         return results[:top_k]
 
