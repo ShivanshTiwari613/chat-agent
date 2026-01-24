@@ -9,6 +9,7 @@ from tavily import TavilyClient
 
 from app.tool.base import BaseTool, ToolResult
 from app.sandbox.e2b_handler import E2BSandbox
+from app.utils.file_processor import EphemeralFileIndex
 from app.utils.logger import logger
 from config.settings import settings
 
@@ -17,7 +18,7 @@ from config.settings import settings
 # ---------------------------------------------------------------------------
 
 class SearchArguments(BaseModel):
-    """Schema for the search_web tool with extensive crawling."""
+    """Schema for the search_and_crawl_web tool."""
     query: Union[str, List[str]] = Field(
         description="Topic or question to research. Can be a single string or a list of queries."
     )
@@ -39,24 +40,26 @@ class SearchArguments(BaseModel):
 class SearchingTool(BaseTool):
     """
     Extensive Web Crawler tool. Gathers deep content from the web and 
-    stores it in the sandbox for analysis.
+    populates the 'Lab' namespace in the Intelligence Engine.
     """
 
     name: str = "search_and_crawl_web"
     description: str = (
         "Performs deep research by searching the web and crawling full page content. "
-        "The raw results are saved to 'research_notes.txt' in your sandbox. "
-        "IMPORTANT: After this tool finishes, you MUST use 'run_python_code' to read "
-        "'research_notes.txt' and find the specific answers requested."
+        "Results are saved to 'research_notes.txt' in the sandbox and indexed in the 'lab' namespace. "
+        "IMPORTANT: This tool returns a summary briefing. To see the full raw content for deep "
+        "extraction, you MUST use the terminal to 'cat' or 'grep' research_notes.txt."
     )
 
     args_schema: Type[BaseModel] = SearchArguments
     _sandbox_handler: E2BSandbox = PrivateAttr()
+    _file_index: Optional[EphemeralFileIndex] = PrivateAttr()
     _tavily: Optional[TavilyClient] = PrivateAttr(default=None)
 
-    def __init__(self, sandbox_handler: E2BSandbox, **data):
+    def __init__(self, sandbox_handler: E2BSandbox, file_index: Optional[EphemeralFileIndex] = None, **data):
         super().__init__(**data)
         self._sandbox_handler = sandbox_handler
+        self._file_index = file_index
         self._tavily = None
         if settings.TAVILY_API_KEY:
             self._tavily = TavilyClient(api_key=settings.TAVILY_API_KEY)
@@ -109,6 +112,7 @@ class SearchingTool(BaseTool):
         urls_to_crawl = list({url for url in (r.get("url") for r in all_results) if isinstance(url, str)})
 
         all_research_data = []
+        summary_briefing = []
         crawled_content_map = {}
 
         # 2. Depth Crawling
@@ -120,36 +124,52 @@ class SearchingTool(BaseTool):
                 for item in extracted:
                     crawled_content_map[item.get("url")] = item.get("raw_content")
 
-        # 3. Consolidation
+        # 3. Consolidation & Briefing Generation
         for r in all_results:
             url = r.get("url")
-            content = crawled_content_map.get(url) or r.get("content")
-            entry = (
-                f"SOURCE: {url}\nTITLE: {r.get('title')}\n"
-                f"CONTENT:\n{content}\n"
-                f"{'='*50}\n"
-            )
+            title = r.get("title")
+            raw_content = crawled_content_map.get(url) or r.get("content")
+            
+            # Full content for the Lab
+            entry = f"SOURCE: {url}\nTITLE: {title}\nCONTENT:\n{raw_content}\n{'='*50}\n"
             all_research_data.append(entry)
+            
+            # Concise summary for the Chat History
+            snippet = r.get("content", "")[:250].replace("\n", " ")
+            summary_briefing.append(f"- {title} ({url})\n  Brief: {snippet}...")
 
         if not all_research_data:
-            return ToolResult(success=False, output_text="No results found on the web.")
+            return ToolResult(success=False, output_text="No research results found.")
 
-        # 4. Save to Sandbox
         combined_data = "\n\n".join(all_research_data)
+
+        # 4. Integrate into Namespaced Index (The 'Lab')
+        try:
+            if self._file_index:
+                self._file_index.add_text(combined_data, "research_notes.txt", namespace="lab")
+                await asyncio.to_thread(self._file_index.finalize)
+        except Exception as e:
+            logger.warning(f"Failed to index search results in Lab: {e}")
+
+        # 5. Save to Sandbox Mirror
         try:
             await self._sandbox_handler.ensure_running()
             sb = self._sandbox_handler.sandbox
             if sb:
                 await asyncio.to_thread(sb.files.write, "research_notes.txt", combined_data)
                 
-                # REFINED OUTPUT: Commands the agent to continue autonomously
-                summary = (
-                    f"SUCCESS: Crawled {len(urls_to_crawl)} sources and saved full content to 'research_notes.txt'. "
-                    "ACTION REQUIRED: You must now use 'run_python_code' to read 'research_notes.txt' "
-                    "and extract the specific details to answer the user's question."
+                briefing_header = (
+                    f"SEARCH COMPLETE: Crawled {len(urls_to_crawl)} sources. "
+                    "The full raw data is saved in the 'lab' namespace and 'research_notes.txt'.\n\n"
+                    "SOURCES FOUND:\n"
                 )
-                return ToolResult(success=True, output_text=summary)
+                final_briefing = briefing_header + "\n".join(summary_briefing) + (
+                    "\n\nNEXT STEP: Use 'execute_terminal_command' (cat/grep) or 'analyze_documents_and_code' "
+                    "(namespace='lab') to extract specific details from these sources."
+                )
+                
+                return ToolResult(success=True, output_text=final_briefing)
         except Exception as e:
             return ToolResult(success=False, output_text="Sandbox write failed.", error_message=str(e))
 
-        return ToolResult(success=False, output_text="Unknown error in search.")
+        return ToolResult(success=False, output_text="Unknown error in searching tool.")

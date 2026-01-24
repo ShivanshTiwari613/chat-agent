@@ -19,6 +19,7 @@ from app.sandbox.e2b_handler import E2BSandbox
 from app.tool.coding_tool import CodingTool
 from app.tool.searching_tool import SearchingTool
 from app.tool.file_tool import FileIntelligenceTool
+from app.tool.terminal_tool import TerminalTool
 from app.utils.file_processor import EphemeralFileIndex, FileProcessor
 from app.utils.logger import logger
 from config.settings import settings
@@ -26,7 +27,7 @@ from config.settings import settings
 
 class AgentEngine:
     """
-    The main orchestrator for a single agent session.
+    The main orchestrator for a single agent session using a Namespaced Intelligence Engine.
     """
 
     def __init__(self, plan_id: str):
@@ -50,19 +51,30 @@ class AgentEngine:
         self.agent_executor: AgentExecutor | None = None
 
     async def add_files(self, file_paths: List[str]):
-        logger.info(f"[{self.plan_id}] Ingesting {len(file_paths)} files...")
+        """
+        Ingests files and ZIPs into the Namespaced Intelligence Engine.
+        Categories: vault (Docs), blueprint (Code), lab (Research).
+        """
+        logger.info(f"[{self.plan_id}] Categorizing and indexing {len(file_paths)} uploads...")
         
+        all_items_to_index = []
+
         for path in file_paths:
             if not os.path.exists(path):
                 logger.warning(f"File not found: {path}")
                 continue
 
             filename = os.path.basename(path)
-            base_name, ext = os.path.splitext(filename)
-            ext = ext.lower()
+            ext = os.path.splitext(filename)[1].lower()
 
-            # Path 1: Data Files (CSV/Excel)
-            if ext in [".csv", ".xlsx", ".xls", ".json"]:
+            # Handle ZIP files (Blueprint/Vault mix)
+            if ext == ".zip":
+                logger.info(f"Processing ZIP archive: {filename}")
+                extracted_items = await asyncio.to_thread(FileProcessor.process_zip, path)
+                all_items_to_index.extend(extracted_items)
+            
+            # Handle Data files (CSV/Excel -> Direct Sandbox)
+            elif ext in [".csv", ".xlsx", ".xls", ".json"]:
                 await self.sandbox_handler.ensure_running()
                 try:
                     with open(path, "rb") as f:
@@ -70,31 +82,45 @@ class AgentEngine:
                         sb = self.sandbox_handler.sandbox
                         if sb:
                             await asyncio.to_thread(sb.files.write, filename, content)
-                            logger.info(f"Uploaded {filename} to Sandbox.")
+                            logger.info(f"Uploaded data file {filename} to Sandbox.")
                 except Exception as e:
                     logger.error(f"Failed to upload {filename} to sandbox: {e}")
+            
+            # Handle individual documents or code files
+            else:
+                content = await asyncio.to_thread(FileProcessor.extract_content, path)
+                if content:
+                    ns = "blueprint" if ext in [".py", ".js", ".ts", ".go", ".java", ".cpp", ".c", ".h"] else "vault"
+                    all_items_to_index.append({
+                        "name": filename,
+                        "content": content,
+                        "namespace": ns
+                    })
 
-            # Path 2 & 3: RAG & Precision Search Support
-            try:
-                text_content = await asyncio.to_thread(FileProcessor.extract_content, path)
-                if text_content:
-                    if ext in [".py", ".js", ".ts", ".go", ".java", ".cpp", ".c"]:
-                        self.file_index.add_code_structure(filename, text_content)
+        # Process all collected items into the Namespaced Index
+        for item in all_items_to_index:
+            name = item["name"]
+            content = item["content"]
+            ns = item["namespace"]
 
-                    self.file_index.add_text(text_content, filename)
+            # 1. Add to RAG Namespace
+            self.file_index.add_text(content, name, namespace=ns)
 
-                    # Save extracted text to Sandbox for "Precision Search Protocol"
-                    await self.sandbox_handler.ensure_running()
-                    sb = self.sandbox_handler.sandbox
-                    if sb:
-                        sandbox_txt_name = f"{base_name}.txt"
-                        await asyncio.to_thread(sb.files.write, sandbox_txt_name, text_content)
-                        logger.info(f"Saved {sandbox_txt_name} for precision searching.")
+            # 2. Map structure if code
+            if ns == "blueprint":
+                self.file_index.add_code_structure(name, content)
 
-            except Exception as e:
-                logger.error(f"Failed to process {filename}: {e}")
+            # 3. Mirror as .txt in Sandbox for Precision Grep Fallback
+            await self.sandbox_handler.ensure_running()
+            sb = self.sandbox_handler.sandbox
+            if sb:
+                # Sanitize name for sandbox (replace path separators)
+                safe_name = name.replace("/", "_").replace("\\", "_")
+                base_name = os.path.splitext(safe_name)[0]
+                await asyncio.to_thread(sb.files.write, f"{base_name}.txt", content)
 
         if self.file_index.chunks:
+            logger.info(f"Finalizing indices for {len(self.file_index.chunks)} chunks...")
             await asyncio.to_thread(self.file_index.finalize)
 
     async def initialize(self):
@@ -104,6 +130,7 @@ class AgentEngine:
         search_logic = SearchingTool(sandbox_handler=self.sandbox_handler)
         coding_logic = CodingTool(sandbox_handler=self.sandbox_handler)
         file_logic = FileIntelligenceTool(index=self.file_index)
+        terminal_logic = TerminalTool(sandbox_handler=self.sandbox_handler)
 
         tools = [
             StructuredTool.from_function(
@@ -124,6 +151,12 @@ class AgentEngine:
                 description=file_logic.description,
                 args_schema=file_logic.args_schema,
             ),
+            StructuredTool.from_function(
+                coroutine=terminal_logic.execute,
+                name=terminal_logic.name,
+                description=terminal_logic.description,
+                args_schema=terminal_logic.args_schema,
+            ),
         ]
 
         prompt = get_agent_prompt()
@@ -139,44 +172,21 @@ class AgentEngine:
         )
 
     def _normalize_output(self, value: Any) -> str:
-        """
-        Extracts clean text from Gemini 2.0 output, handling potential dict/list structures
-        and stripping internal metadata markers.
-        """
-        if not value:
-            return ""
-
-        # If it's already a clean string, just strip minor metadata leftovers
+        if not value: return ""
         if isinstance(value, str):
-            # Attempt to parse as JSON if it looks like a Gemini dict-string
             if value.startswith("{") and "text" in value:
                 try:
-                    data = json.loads(value.replace("'", '"')) # Simple fix for single quotes
-                    if isinstance(data, dict):
-                        return data.get("text", value)
-                except:
-                    pass
-            
-            # Fallback to regex cleaning if JSON parsing fails
+                    data = json.loads(value.replace("'", '"'))
+                    if isinstance(data, dict): return data.get("text", value)
+                except: pass
             clean = re.sub(r"'extras':\s*\{.*?\}(,\s*)?", "", value, flags=re.DOTALL)
             clean = re.sub(r"'signature':\s*'.*?'(,\s*)?", "", clean, flags=re.DOTALL)
             clean = re.sub(r"'index':\s*\d+(,\s*)?", "", clean, flags=re.DOTALL)
             return clean.strip("{}[]' \n")
-
-        # Handle List of parts (often seen in Gemini streaming)
         if isinstance(value, list):
-            parts = []
-            for item in value:
-                if isinstance(item, dict):
-                    parts.append(item.get("text", ""))
-                else:
-                    parts.append(str(item))
-            return "".join(parts).strip()
-
-        # Handle single dictionary
+            return "".join([item.get("text", str(item)) if isinstance(item, dict) else str(item) for item in value]).strip()
         if isinstance(value, dict):
             return value.get("text", str(value)).strip()
-
         return str(value).strip()
 
     async def chat(
@@ -185,15 +195,23 @@ class AgentEngine:
         if not self.agent_executor:
             raise RuntimeError("Agent not initialized.")
 
-        # --- SESSION STATE INJECTION ---
-        # Get unique filenames from the index
-        indexed_files = list(set(m['source'] for m in self.file_index.chunk_metadata))
-        file_context = ""
-        if indexed_files:
-            file_context = f"\n\n[SESSION CONTEXT: The following files are currently indexed and available in your sandbox as .txt files: {', '.join(indexed_files)}]"
+        # --- NAMESPACED SESSION CONTEXT INJECTION ---
+        namespaces = {}
+        for m in self.file_index.chunk_metadata:
+            ns = m['namespace']
+            source = m['source']
+            if ns not in namespaces: namespaces[ns] = set()
+            namespaces[ns].add(source)
 
-        # Combine user input with context to ensure the agent never "forgets" what it has
-        contextual_input = f"{user_input}{file_context}"
+        context_parts = ["\n\n[SESSION CONTEXT - NAMESPACED FILES]:"]
+        if not namespaces:
+            context_parts.append("- No files currently indexed.")
+        else:
+            for ns, files in namespaces.items():
+                context_parts.append(f"- {ns.upper()}: {', '.join(files)}")
+        
+        context_parts.append("\nNote: All indexed text is also available in your sandbox as .txt files for precision searching.")
+        contextual_input = f"{user_input}{''.join(context_parts)}"
 
         yield AgentEvent(type="status", label="START", details="Agent thinking...")
 
