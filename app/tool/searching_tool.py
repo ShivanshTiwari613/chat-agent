@@ -89,7 +89,8 @@ class SearchingTool(BaseTool):
             resp = await loop.run_in_executor(None, call)
             return resp.get("results", [])
         except Exception as e:
-            logger.error(f"Tavily extraction error: {e}")
+            # Fallback for keys that don't support the Extract API
+            logger.warning(f"Tavily extraction not available or failed: {e}")
             return []
 
     async def execute(
@@ -128,25 +129,30 @@ class SearchingTool(BaseTool):
         for r in all_results:
             url = r.get("url")
             title = r.get("title")
-            raw_content = crawled_content_map.get(url) or r.get("content")
+            # Use crawled content if available, else fall back to the search snippet
+            raw_content = crawled_content_map.get(url) or r.get("raw_content") or r.get("content")
             
-            # Full content for the Lab
+            # Clean content for storage
+            if raw_content:
+                raw_content = "".join(char for char in raw_content if ord(char) >= 32 or char in "\n\r\t")
+            
             entry = f"SOURCE: {url}\nTITLE: {title}\nCONTENT:\n{raw_content}\n{'='*50}\n"
             all_research_data.append(entry)
             
-            # Concise summary for the Chat History
             snippet = r.get("content", "")[:250].replace("\n", " ")
             summary_briefing.append(f"- {title} ({url})\n  Brief: {snippet}...")
 
         if not all_research_data:
-            return ToolResult(success=False, output_text="No research results found.")
+            return ToolResult(success=False, output_text="No research results found for the given query.")
 
         combined_data = "\n\n".join(all_research_data)
 
         # 4. Integrate into Namespaced Index (The 'Lab')
         try:
             if self._file_index:
+                # We use a specific source name to allow overriding old research if desired
                 self._file_index.add_text(combined_data, "research_notes.txt", namespace="lab")
+                # Finalize updates the vector index with the new 'Lab' chunks
                 await asyncio.to_thread(self._file_index.finalize)
         except Exception as e:
             logger.warning(f"Failed to index search results in Lab: {e}")
@@ -156,20 +162,22 @@ class SearchingTool(BaseTool):
             await self._sandbox_handler.ensure_running()
             sb = self._sandbox_handler.sandbox
             if sb:
+                # Write as a text file for Terminal/Python access
                 await asyncio.to_thread(sb.files.write, "research_notes.txt", combined_data)
                 
                 briefing_header = (
-                    f"SEARCH COMPLETE: Crawled {len(urls_to_crawl)} sources. "
+                    f"SEARCH COMPLETE: Analyzed {len(urls_to_crawl)} sources. "
                     "The full raw data is saved in the 'lab' namespace and 'research_notes.txt'.\n\n"
-                    "SOURCES FOUND:\n"
+                    "TOP SOURCES:\n"
                 )
-                final_briefing = briefing_header + "\n".join(summary_briefing) + (
-                    "\n\nNEXT STEP: Use 'execute_terminal_command' (cat/grep) or 'analyze_documents_and_code' "
-                    "(namespace='lab') to extract specific details from these sources."
+                final_briefing = briefing_header + "\n".join(summary_briefing[:10]) + (
+                    "\n\nNEXT STEP: Use 'execute_terminal_command' (grep) or 'run_python_code' "
+                    "to extract specific data points from 'research_notes.txt'."
                 )
                 
                 return ToolResult(success=True, output_text=final_briefing)
         except Exception as e:
-            return ToolResult(success=False, output_text="Sandbox write failed.", error_message=str(e))
+            logger.error(f"Sandbox write failed during search: {e}")
+            return ToolResult(success=False, output_text="Research gathered but failed to save to sandbox.", error_message=str(e))
 
-        return ToolResult(success=False, output_text="Unknown error in searching tool.")
+        return ToolResult(success=False, output_text="Unknown error occurred during web research.")

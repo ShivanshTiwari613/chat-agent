@@ -20,10 +20,10 @@ class CodingTool(BaseTool):
     name: str = "run_python_code"
     description: str = (
         "Executes Python code in a stateful sandbox. Use this for calculations, "
-        "data analysis (pandas/matplotlib), and PRECISION SEARCH within files. "
+        "complex data analysis (pandas/matplotlib), and PRECISION SEARCH within files. "
         "All uploaded documents are available as .txt files in the current directory. "
-        "If analyze_documents_and_code gives lackluster results, read the file here "
-        "and use string searching to find exact context. Always print your results."
+        "If you generate a plot or a file, inform the user it is available in the environment. "
+        "Always print() the final result or variables you want to see."
     )
     
     args_schema: Type[BaseModel] = CodingArguments
@@ -58,6 +58,7 @@ class CodingTool(BaseTool):
                     break
                 except Exception as e:
                     if "port" in str(e).lower() or "502" in str(e):
+                        logger.warning(f"Sandbox connection attempt {attempt+1} failed, retrying...")
                         await asyncio.sleep(1 * (attempt + 1))
                         continue
                     raise
@@ -65,27 +66,37 @@ class CodingTool(BaseTool):
             if execution is None:
                 raise RuntimeError("Sandbox execution failed to initialize.")
 
-            # Process logs
+            # 1. Process standard output and errors
             stdout = "\n".join(execution.logs.stdout)
             stderr = "\n".join(execution.logs.stderr)
 
+            # 2. Process rich results (dataframes, plots, etc.)
             results_text = []
             for result in execution.results:
+                # Handle text-based results
                 if hasattr(result, "text") and result.text:
                     results_text.append(result.text)
-                elif hasattr(result, "formats"):
-                    # Capture presence of charts or dataframes
+                
+                # Handle visual/binary results (like Matplotlib charts)
+                if hasattr(result, "formats"):
                     formats = result.formats() if callable(result.formats) else result.formats
-                    if isinstance(formats, dict):
-                        results_text.append(f"[Visual Output: {list(formats.keys())}]")
+                    if isinstance(formats, dict) and formats:
+                        found_formats = [fmt for fmt in formats.keys() if fmt != 'text']
+                        if found_formats:
+                            results_text.append(f"[Visual Output Generated: {', '.join(found_formats)}]")
 
+            # 3. Construct final output string
             output_parts = []
-            if stdout: output_parts.append(f"STDOUT:\n{stdout}")
-            if stderr: output_parts.append(f"STDERR:\n{stderr}")
-            if results_text: output_parts.append("RESULTS:\n" + "\n".join(results_text))
+            if stdout: 
+                output_parts.append(f"--- STDOUT ---\n{stdout}")
+            if stderr: 
+                output_parts.append(f"--- STDERR ---\n{stderr}")
+            if results_text: 
+                output_parts.append("--- RESULTS ---\n" + "\n".join(results_text))
 
             final_output = "\n\n".join(output_parts) if output_parts else "Executed successfully (no output)."
 
+            # Handle execution errors reported by the sandbox
             if execution.error:
                 return ToolResult(
                     success=False,
@@ -97,4 +108,4 @@ class CodingTool(BaseTool):
 
         except Exception as e:
             logger.error(f"CodingTool Failure: {e}")
-            return ToolResult(success=False, output_text="Execution error.", error_message=str(e))
+            return ToolResult(success=False, output_text="Execution error occurred.", error_message=str(e))

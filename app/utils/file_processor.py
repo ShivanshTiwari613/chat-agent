@@ -123,6 +123,7 @@ class EphemeralFileIndex:
         embeddings_np = np.array(embeddings).astype('float32')
         
         dimension = int(embeddings_np.shape[1])
+        # Reset index to handle new data if finalize is called again
         self.vector_index = faiss.IndexFlatL2(dimension)
         self.vector_index.add(embeddings_np) # type: ignore
         logger.info("Intelligence indices finalized.")
@@ -148,10 +149,9 @@ class EphemeralFileIndex:
         # 1. Vector Search
         query_vec = np.array(self.encoder.encode([query])).astype('float32')
         # We search more than top_k to allow for namespace filtering
-        search_k = top_k * 3 if namespace else top_k
+        search_k = top_k * 5 if namespace else top_k * 2
         distances, v_indices = self.vector_index.search(query_vec, search_k) # type: ignore
         
-        # Filter vector results by namespace if provided
         final_v_indices = []
         for idx in v_indices[0]:
             if idx == -1: continue
@@ -169,17 +169,34 @@ class EphemeralFileIndex:
             # Map top scores back to original global indices
             ns_global_map = [i for i, m in enumerate(self.chunk_metadata) if m['namespace'] == namespace]
             top_ns_indices = np.argsort(scores)[-top_k:][::-1]
-            final_b_indices = [ns_global_map[i] for i in top_ns_indices]
+            final_b_indices = [ns_global_map[i] for i in top_ns_indices if scores[i] > 0]
 
-        # Consolidate results
-        combined = sorted(list(set(final_v_indices) | set(final_b_indices)))
+        # Consolidate results: Interleave BM25 and Vector to ensure variety
+        combined_indices = []
+        v_ptr, b_ptr = 0, 0
+        seen = set()
+
+        while len(combined_indices) < top_k and (v_ptr < len(final_v_indices) or b_ptr < len(final_b_indices)):
+            if v_ptr < len(final_v_indices):
+                idx = final_v_indices[v_ptr]
+                if idx not in seen:
+                    combined_indices.append(idx)
+                    seen.add(idx)
+                v_ptr += 1
+            
+            if len(combined_indices) < top_k and b_ptr < len(final_b_indices):
+                idx = final_b_indices[b_ptr]
+                if idx not in seen:
+                    combined_indices.append(idx)
+                    seen.add(idx)
+                b_ptr += 1
         
         results: List[str] = []
-        for idx in combined:
+        for idx in combined_indices:
             m = self.chunk_metadata[idx]
             results.append(f"[Namespace: {m['namespace']} | File: {m['source']}]:\n{self.chunks[idx]}")
         
-        return results[:top_k]
+        return results
 
 class FileProcessor:
     @staticmethod

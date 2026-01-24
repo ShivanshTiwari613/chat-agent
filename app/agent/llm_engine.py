@@ -39,7 +39,7 @@ class AgentEngine:
             model=settings.GEMINI_MODEL_NAME,
             temperature=0,
             google_api_key=settings.GOOGLE_API_KEY,
-            max_output_tokens=4096,
+            max_output_tokens=8192,
             safety_settings={
                 HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
                 HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -53,7 +53,6 @@ class AgentEngine:
     async def add_files(self, file_paths: List[str]):
         """
         Ingests files and ZIPs into the Namespaced Intelligence Engine.
-        Categories: vault (Docs), blueprint (Code), lab (Research).
         """
         logger.info(f"[{self.plan_id}] Categorizing and indexing {len(file_paths)} uploads...")
         
@@ -67,13 +66,9 @@ class AgentEngine:
             filename = os.path.basename(path)
             ext = os.path.splitext(filename)[1].lower()
 
-            # Handle ZIP files (Blueprint/Vault mix)
             if ext == ".zip":
-                logger.info(f"Processing ZIP archive: {filename}")
                 extracted_items = await asyncio.to_thread(FileProcessor.process_zip, path)
                 all_items_to_index.extend(extracted_items)
-            
-            # Handle Data files (CSV/Excel -> Direct Sandbox)
             elif ext in [".csv", ".xlsx", ".xls", ".json"]:
                 await self.sandbox_handler.ensure_running()
                 try:
@@ -82,107 +77,67 @@ class AgentEngine:
                         sb = self.sandbox_handler.sandbox
                         if sb:
                             await asyncio.to_thread(sb.files.write, filename, content)
-                            logger.info(f"Uploaded data file {filename} to Sandbox.")
                 except Exception as e:
                     logger.error(f"Failed to upload {filename} to sandbox: {e}")
-            
-            # Handle individual documents or code files
             else:
                 content = await asyncio.to_thread(FileProcessor.extract_content, path)
                 if content:
                     ns = "blueprint" if ext in [".py", ".js", ".ts", ".go", ".java", ".cpp", ".c", ".h"] else "vault"
-                    all_items_to_index.append({
-                        "name": filename,
-                        "content": content,
-                        "namespace": ns
-                    })
+                    all_items_to_index.append({"name": filename, "content": content, "namespace": ns})
 
-        # Process all collected items into the Namespaced Index
         for item in all_items_to_index:
-            name = item["name"]
-            content = item["content"]
-            ns = item["namespace"]
-
-            # 1. Add to RAG Namespace
-            self.file_index.add_text(content, name, namespace=ns)
-
-            # 2. Map structure if code
-            if ns == "blueprint":
-                self.file_index.add_code_structure(name, content)
-
-            # 3. Mirror as .txt in Sandbox for Precision Grep Fallback
+            self.file_index.add_text(item["content"], item["name"], namespace=item["namespace"])
+            if item["namespace"] == "blueprint":
+                self.file_index.add_code_structure(item["name"], item["content"])
+            
             await self.sandbox_handler.ensure_running()
             sb = self.sandbox_handler.sandbox
             if sb:
-                # Sanitize name for sandbox (replace path separators)
-                safe_name = name.replace("/", "_").replace("\\", "_")
-                base_name = os.path.splitext(safe_name)[0]
-                await asyncio.to_thread(sb.files.write, f"{base_name}.txt", content)
+                # IMPORTANT: Map all uploads to .txt for precision searching
+                safe_name = item["name"].replace("/", "_").replace("\\", "_")
+                ext_check = os.path.splitext(safe_name)[1].lower()
+                if ext_check != ".txt":
+                    safe_name = f"{os.path.splitext(safe_name)[0]}.txt"
+                await asyncio.to_thread(sb.files.write, safe_name, item["content"])
 
         if self.file_index.chunks:
-            logger.info(f"Finalizing indices for {len(self.file_index.chunks)} chunks...")
             await asyncio.to_thread(self.file_index.finalize)
 
     async def initialize(self):
-        logger.info(f"[{self.plan_id}] Initializing Agent Engine Chain...")
         await self.sandbox_handler.start()
 
-        search_logic = SearchingTool(sandbox_handler=self.sandbox_handler)
+        search_logic = SearchingTool(sandbox_handler=self.sandbox_handler, file_index=self.file_index)
         coding_logic = CodingTool(sandbox_handler=self.sandbox_handler)
         file_logic = FileIntelligenceTool(index=self.file_index)
         terminal_logic = TerminalTool(sandbox_handler=self.sandbox_handler)
 
         tools = [
-            StructuredTool.from_function(
-                coroutine=search_logic.execute,
-                name=search_logic.name,
-                description=search_logic.description,
-                args_schema=search_logic.args_schema,
-            ),
-            StructuredTool.from_function(
-                coroutine=coding_logic.execute,
-                name=coding_logic.name,
-                description=coding_logic.description,
-                args_schema=coding_logic.args_schema,
-            ),
-            StructuredTool.from_function(
-                coroutine=file_logic.execute,
-                name=file_logic.name,
-                description=file_logic.description,
-                args_schema=file_logic.args_schema,
-            ),
-            StructuredTool.from_function(
-                coroutine=terminal_logic.execute,
-                name=terminal_logic.name,
-                description=terminal_logic.description,
-                args_schema=terminal_logic.args_schema,
-            ),
+            StructuredTool.from_function(coroutine=search_logic.execute, name=search_logic.name, description=search_logic.description, args_schema=search_logic.args_schema),
+            StructuredTool.from_function(coroutine=coding_logic.execute, name=coding_logic.name, description=coding_logic.description, args_schema=coding_logic.args_schema),
+            StructuredTool.from_function(coroutine=file_logic.execute, name=file_logic.name, description=file_logic.description, args_schema=file_logic.args_schema),
+            StructuredTool.from_function(coroutine=terminal_logic.execute, name=terminal_logic.name, description=terminal_logic.description, args_schema=terminal_logic.args_schema),
         ]
 
-        prompt = get_agent_prompt()
-        agent = create_tool_calling_agent(self.llm, tools, prompt)
-
         self.agent_executor = AgentExecutor(
-            agent=agent,
+            agent=create_tool_calling_agent(self.llm, tools, get_agent_prompt()),
             tools=tools,
             verbose=True,
             return_intermediate_steps=True,
             handle_parsing_errors=True,
-            max_iterations=15,
+            max_iterations=20,
         )
 
     def _normalize_output(self, value: Any) -> str:
         if not value: return ""
         if isinstance(value, str):
-            if value.startswith("{") and "text" in value:
+            if value.strip().startswith("{") and "text" in value:
                 try:
                     data = json.loads(value.replace("'", '"'))
-                    if isinstance(data, dict): return data.get("text", value)
+                    if isinstance(data, dict): value = data.get("text", value)
                 except: pass
             clean = re.sub(r"'extras':\s*\{.*?\}(,\s*)?", "", value, flags=re.DOTALL)
             clean = re.sub(r"'signature':\s*'.*?'(,\s*)?", "", clean, flags=re.DOTALL)
-            clean = re.sub(r"'index':\s*\d+(,\s*)?", "", clean, flags=re.DOTALL)
-            return clean.strip("{}[]' \n")
+            return clean.strip()
         if isinstance(value, list):
             return "".join([item.get("text", str(item)) if isinstance(item, dict) else str(item) for item in value]).strip()
         if isinstance(value, dict):
@@ -195,7 +150,6 @@ class AgentEngine:
         if not self.agent_executor:
             raise RuntimeError("Agent not initialized.")
 
-        # --- NAMESPACED SESSION CONTEXT INJECTION ---
         namespaces = {}
         for m in self.file_index.chunk_metadata:
             ns = m['namespace']
@@ -210,7 +164,8 @@ class AgentEngine:
             for ns, files in namespaces.items():
                 context_parts.append(f"- {ns.upper()}: {', '.join(files)}")
         
-        context_parts.append("\nNote: All indexed text is also available in your sandbox as .txt files for precision searching.")
+        # Explicitly tell the agent that file extensions are changed in the sandbox
+        context_parts.append("\nNote: Code files are mirrored as .txt in the sandbox for safety.")
         contextual_input = f"{user_input}{''.join(context_parts)}"
 
         yield AgentEvent(type="status", label="START", details="Agent thinking...")
@@ -225,29 +180,22 @@ class AgentEngine:
                 if "actions" in chunk:
                     for action in chunk["actions"]:
                         saw_tool_call = True
-                        tool_name = getattr(action, "tool", "tool")
-                        yield AgentEvent(type="tool", label="TOOL_CALL", details=f"Agent using {tool_name}...")
-
+                        yield AgentEvent(type="tool", label="TOOL_CALL", details=f"Agent using {getattr(action, 'tool', 'tool')}...")
                 elif "steps" in chunk:
                     for action_obj, _ in chunk["steps"]:
-                        tool_name = getattr(action_obj, "tool", "tool")
-                        yield AgentEvent(type="observation", label="TOOL_RESULT", details=f"Finished {tool_name}.")
-                
+                        yield AgentEvent(type="observation", label="TOOL_RESULT", details=f"Finished {getattr(action_obj, 'tool', 'tool')}.")
                 elif "output" in chunk:
                     final_output_captured = self._normalize_output(chunk["output"])
-                    if final_output_captured:
-                        yield AgentEvent(type="result", label="ANSWER", details=final_output_captured)
+                    # FIXED: Yield even if the answer is short/empty to acknowledge completion
+                    yield AgentEvent(type="result", label="ANSWER", details=final_output_captured or "[No output generated by agent]")
 
             if not final_output_captured and not saw_tool_call:
-                result = await self.agent_executor.ainvoke(
-                    {"input": contextual_input, "chat_history": chat_history}
-                )
+                result = await self.agent_executor.ainvoke({"input": contextual_input, "chat_history": chat_history})
                 final_output_captured = self._normalize_output(result.get("output", ""))
-                if final_output_captured:
-                    yield AgentEvent(type="result", label="ANSWER", details=final_output_captured)
+                yield AgentEvent(type="result", label="ANSWER", details=final_output_captured or "[Task complete, but no specific message provided]")
 
         except Exception as e:
-            logger.error(f"Error during agent chat execution: {e}", exc_info=True)
+            logger.error(f"Chat error: {e}", exc_info=True)
             yield AgentEvent(type="error", label="ERROR", details=str(e))
 
     async def cleanup(self):
