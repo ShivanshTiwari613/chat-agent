@@ -27,7 +27,8 @@ from config.settings import settings
 
 class AgentEngine:
     """
-    The main orchestrator for a single agent session using a Namespaced Intelligence Engine.
+    Orchestrator for Staged Hybrid Filtering.
+    Features: Ultra-robust output normalization and execution safety.
     """
 
     def __init__(self, plan_id: str):
@@ -51,34 +52,22 @@ class AgentEngine:
         self.agent_executor: AgentExecutor | None = None
 
     async def add_files(self, file_paths: List[str]):
-        """
-        Ingests files and ZIPs into the Namespaced Intelligence Engine.
-        """
-        logger.info(f"[{self.plan_id}] Categorizing and indexing {len(file_paths)} uploads...")
-        
+        """Ingests files into the Staged Intelligence Engine."""
         all_items_to_index = []
-
         for path in file_paths:
-            if not os.path.exists(path):
-                logger.warning(f"File not found: {path}")
-                continue
-
+            if not os.path.exists(path): continue
             filename = os.path.basename(path)
             ext = os.path.splitext(filename)[1].lower()
 
             if ext == ".zip":
-                extracted_items = await asyncio.to_thread(FileProcessor.process_zip, path)
-                all_items_to_index.extend(extracted_items)
+                extracted = await asyncio.to_thread(FileProcessor.process_zip, path)
+                all_items_to_index.extend(extracted)
             elif ext in [".csv", ".xlsx", ".xls", ".json"]:
                 await self.sandbox_handler.ensure_running()
-                try:
-                    with open(path, "rb") as f:
-                        content = f.read()
-                        sb = self.sandbox_handler.sandbox
-                        if sb:
-                            await asyncio.to_thread(sb.files.write, filename, content)
-                except Exception as e:
-                    logger.error(f"Failed to upload {filename} to sandbox: {e}")
+                with open(path, "rb") as f:
+                    content = f.read()
+                    sb = self.sandbox_handler.sandbox
+                    if sb: await asyncio.to_thread(sb.files.write, filename, content)
             else:
                 content = await asyncio.to_thread(FileProcessor.extract_content, path)
                 if content:
@@ -93,10 +82,8 @@ class AgentEngine:
             await self.sandbox_handler.ensure_running()
             sb = self.sandbox_handler.sandbox
             if sb:
-                # IMPORTANT: Map all uploads to .txt for precision searching
                 safe_name = item["name"].replace("/", "_").replace("\\", "_")
-                ext_check = os.path.splitext(safe_name)[1].lower()
-                if ext_check != ".txt":
+                if not safe_name.lower().endswith(".txt"):
                     safe_name = f"{os.path.splitext(safe_name)[0]}.txt"
                 await asyncio.to_thread(sb.files.write, safe_name, item["content"])
 
@@ -104,6 +91,7 @@ class AgentEngine:
             await asyncio.to_thread(self.file_index.finalize)
 
     async def initialize(self):
+        """Correctly initializes tools by instantiating them first."""
         await self.sandbox_handler.start()
 
         search_logic = SearchingTool(sandbox_handler=self.sandbox_handler, file_index=self.file_index)
@@ -122,82 +110,103 @@ class AgentEngine:
             agent=create_tool_calling_agent(self.llm, tools, get_agent_prompt()),
             tools=tools,
             verbose=True,
-            return_intermediate_steps=True,
             handle_parsing_errors=True,
-            max_iterations=20,
+            max_iterations=15,
         )
 
     def _normalize_output(self, value: Any) -> str:
+        """
+        Hyper-robust normalization.
+        Extracts clean text from complex JSON objects, lists, and signature blocks.
+        """
         if not value: return ""
-        if isinstance(value, str):
-            if value.strip().startswith("{") and "text" in value:
-                try:
-                    data = json.loads(value.replace("'", '"'))
-                    if isinstance(data, dict): value = data.get("text", value)
-                except: pass
-            clean = re.sub(r"'extras':\s*\{.*?\}(,\s*)?", "", value, flags=re.DOTALL)
-            clean = re.sub(r"'signature':\s*'.*?'(,\s*)?", "", clean, flags=re.DOTALL)
-            return clean.strip()
-        if isinstance(value, list):
-            return "".join([item.get("text", str(item)) if isinstance(item, dict) else str(item) for item in value]).strip()
+        
+        # 1. Handle tool result objects
+        if hasattr(value, "output_text"):
+            return str(value.output_text).strip()
+        
+        # 2. Handle Dictionary results
         if isinstance(value, dict):
-            return value.get("text", str(value)).strip()
+            # Check for standard content keys first
+            for key in ["text", "output_text", "output", "content"]:
+                if key in value and value[key]:
+                    return self._normalize_output(value[key])
+            # If no clear text key, check if it's a list under 'content'
+            if "content" in value and isinstance(value["content"], list):
+                return self._normalize_output(value["content"])
+            return json.dumps(value)
+
+        # 3. Handle Lists
+        if isinstance(value, list):
+            return "\n".join([self._normalize_output(v) for v in value if v]).strip()
+
+        # 4. Handle Strings & JSON-Strings
+        if isinstance(value, str):
+            val = value.strip()
+            
+            # If string looks like JSON, try to parse it
+            if (val.startswith("{") and val.endswith("}")) or (val.startswith("[") and val.endswith("]")):
+                try:
+                    # Cleanup common encoding errors before parse
+                    clean_json = val.replace('\\"', '"').replace('\\n', '\n')
+                    data = json.loads(clean_json)
+                    return self._normalize_output(data)
+                except: pass
+            
+            # Aggressively strip technical noise via Regex
+            val = re.sub(r'["\']extras["\']:\s*\{.*?\}', "", val, flags=re.DOTALL)
+            val = re.sub(r'["\']signature["\']:\s*["\'].*?["\']', "", val, flags=re.DOTALL)
+            val = re.sub(r'["\']type["\']:\s*["\']text["\']', "", val)
+            
+            # Final bracket/key cleanup
+            val = val.lstrip('{').rstrip('}').strip()
+            if '"text":' in val:
+                val = val.split('"text":', 1)[1].strip().lstrip('"').rsplit('"', 1)[0]
+            
+            return val.strip()
+
         return str(value).strip()
 
     async def chat(
         self, user_input: str, chat_history: List[BaseMessage] = []
     ) -> AsyncGenerator[AgentEvent, None]:
-        if not self.agent_executor:
-            raise RuntimeError("Agent not initialized.")
+        if not self.agent_executor: raise RuntimeError("Agent not initialized.")
 
         namespaces = {}
         for m in self.file_index.chunk_metadata:
             ns = m['namespace']
-            source = m['source']
             if ns not in namespaces: namespaces[ns] = set()
-            namespaces[ns].add(source)
+            namespaces[ns].add(m['source'])
 
-        context_parts = ["\n\n[SESSION CONTEXT - NAMESPACED FILES]:"]
-        if not namespaces:
-            context_parts.append("- No files currently indexed.")
-        else:
-            for ns, files in namespaces.items():
-                context_parts.append(f"- {ns.upper()}: {', '.join(files)}")
+        context_parts = ["\n\n[INTELLIGENCE POOLS]:"]
+        for ns, files in namespaces.items():
+            context_parts.append(f"- {ns.upper()}: {', '.join(files)}")
         
-        # Explicitly tell the agent that file extensions are changed in the sandbox
-        context_parts.append("\nNote: Code files are mirrored as .txt in the sandbox for safety.")
         contextual_input = f"{user_input}{''.join(context_parts)}"
-
-        yield AgentEvent(type="status", label="START", details="Agent thinking...")
+        yield AgentEvent(type="status", label="START", details="Thinking...")
 
         final_output_captured: str = ""
-        saw_tool_call = False
-
         try:
             async for chunk in self.agent_executor.astream(
                 {"input": contextual_input, "chat_history": chat_history}
             ):
                 if "actions" in chunk:
                     for action in chunk["actions"]:
-                        saw_tool_call = True
-                        yield AgentEvent(type="tool", label="TOOL_CALL", details=f"Agent using {getattr(action, 'tool', 'tool')}...")
-                elif "steps" in chunk:
-                    for action_obj, _ in chunk["steps"]:
-                        yield AgentEvent(type="observation", label="TOOL_RESULT", details=f"Finished {getattr(action_obj, 'tool', 'tool')}.")
+                        yield AgentEvent(type="tool", label="TOOL", details=f"Searching {action.tool}...")
                 elif "output" in chunk:
                     final_output_captured = self._normalize_output(chunk["output"])
-                    # FIXED: Yield even if the answer is short/empty to acknowledge completion
-                    yield AgentEvent(type="result", label="ANSWER", details=final_output_captured or "[No output generated by agent]")
+                    if final_output_captured:
+                        yield AgentEvent(type="result", label="ANSWER", details=final_output_captured)
 
-            if not final_output_captured and not saw_tool_call:
+            # CRITICAL FALLBACK: If stream provided no result or malformed JSON
+            if not final_output_captured:
                 result = await self.agent_executor.ainvoke({"input": contextual_input, "chat_history": chat_history})
                 final_output_captured = self._normalize_output(result.get("output", ""))
-                yield AgentEvent(type="result", label="ANSWER", details=final_output_captured or "[Task complete, but no specific message provided]")
+                yield AgentEvent(type="result", label="ANSWER", details=final_output_captured or "Analysis complete.")
 
         except Exception as e:
             logger.error(f"Chat error: {e}", exc_info=True)
             yield AgentEvent(type="error", label="ERROR", details=str(e))
 
     async def cleanup(self):
-        if self.sandbox_handler:
-            self.sandbox_handler.close()
+        if self.sandbox_handler: self.sandbox_handler.close()

@@ -22,14 +22,19 @@ class EphemeralFileIndex:
         self.chunks: List[str] = []
         
         # Enhanced metadata to support Namespacing
-        # category: 'vault' (docs), 'blueprint' (code), 'lab' (research)
         self.chunk_metadata: List[Dict[str, Any]] = []
         
         # High-level structural maps for code (blueprint)
         self.code_map: Dict[str, List[str]] = {} 
         
         self.bm25_indices: Dict[str, BM25Okapi] = {} # Namespace -> BM25
-        self.vector_index: Optional[faiss.IndexFlatL2] = None
+        
+        # STAGE 1 IMPLEMENTATION: Namespaced Vector Indices
+        # We store a separate FAISS index per namespace for "Pre-filtering"
+        self.vector_indices: Dict[str, faiss.IndexFlatL2] = {}
+        
+        # Map to track global chunk indices for each namespace index
+        self.ns_to_global_map: Dict[str, List[int]] = {}
 
     def add_code_structure(self, filename: str, content: str):
         """Uses Tree-Sitter to map out code symbols for the 'Blueprint' namespace."""
@@ -46,7 +51,6 @@ class EphemeralFileIndex:
             parser = get_parser(language_name)
             tree = parser.parse(bytes(content, "utf8"))
             
-            # Focused queries for structural mapping
             query_map = {
                 "python": "(function_definition name: (identifier) @f) (class_definition name: (identifier) @c)",
                 "javascript": "(function_declaration name: (identifier) @f) (class_declaration name: (identifier) @c)",
@@ -60,11 +64,12 @@ class EphemeralFileIndex:
             captures = query.captures(tree.root_node)
             
             signatures = []
-            capture_items = captures.items() if isinstance(captures, dict) else captures
-            for node, tag in capture_items:
-                node_text = content[node.start_byte:node.end_byte]
-                line = node_text.splitlines()[0]
-                signatures.append(f"{tag.upper()}: {line}")
+            # Normalize capture handling for different tree-sitter versions
+            if isinstance(captures, list):
+                for node, tag in captures:
+                    node_text = content[node.start_byte:node.end_byte]
+                    line = node_text.splitlines()[0]
+                    signatures.append(f"{tag.upper()}: {line}")
             
             if signatures:
                 self.code_map[filename] = signatures
@@ -78,10 +83,10 @@ class EphemeralFileIndex:
         text = text.replace('\x00', '') 
         words = text.split()
         
-        # Context-rich chunking
         chunk_size = 600  
         overlap = 150     
         
+        start_idx = len(self.chunks)
         if len(words) <= chunk_size:
             self.chunks.append(text)
             self.chunk_metadata.append({
@@ -89,44 +94,50 @@ class EphemeralFileIndex:
                 "namespace": namespace, 
                 "chunk_idx": 0
             })
-            return
-
-        idx = 0
-        for i in range(0, len(words), chunk_size - overlap):
-            chunk = " ".join(words[i : i + chunk_size])
-            self.chunks.append(chunk)
-            self.chunk_metadata.append({
-                "source": source_name, 
-                "namespace": namespace, 
-                "chunk_idx": idx
-            })
-            idx += 1
-            if i + chunk_size >= len(words): break
+        else:
+            idx = 0
+            for i in range(0, len(words), chunk_size - overlap):
+                chunk = " ".join(words[i : i + chunk_size])
+                self.chunks.append(chunk)
+                self.chunk_metadata.append({
+                    "source": source_name, 
+                    "namespace": namespace, 
+                    "chunk_idx": idx
+                })
+                idx += 1
+                if i + chunk_size >= len(words): break
 
     def finalize(self):
-        """Builds namespaced BM25 and a global Vector index."""
+        """Builds namespaced BM25 and separate Vector indices (Pre-filtered)."""
         if not self.chunks: return
         
-        # 1. Build Namespaced BM25 (Deterministic Keyword Matching)
         namespaces = set(m['namespace'] for m in self.chunk_metadata)
-        for ns in namespaces:
-            ns_chunks = [
-                self.chunks[i].lower().split() 
-                for i, m in enumerate(self.chunk_metadata) if m['namespace'] == ns
-            ]
-            if ns_chunks:
-                self.bm25_indices[ns] = BM25Okapi(ns_chunks)
-
-        # 2. Global Vector Index (MPNet Semantic Matching)
-        logger.info(f"Computing MPNet embeddings for {len(self.chunks)} chunks...")
-        embeddings = self.encoder.encode(self.chunks, show_progress_bar=False)
-        embeddings_np = np.array(embeddings).astype('float32')
         
-        dimension = int(embeddings_np.shape[1])
-        # Reset index to handle new data if finalize is called again
-        self.vector_index = faiss.IndexFlatL2(dimension)
-        self.vector_index.add(embeddings_np) # type: ignore
-        logger.info("Intelligence indices finalized.")
+        # Reset indices
+        self.bm25_indices = {}
+        self.vector_indices = {}
+        self.ns_to_global_map = {}
+
+        logger.info(f"Computing embeddings for {len(self.chunks)} chunks across {len(namespaces)} namespaces...")
+        all_embeddings = self.encoder.encode(self.chunks, show_progress_bar=False)
+
+        for ns in namespaces:
+            # 1. Collect global indices for this namespace
+            ns_global_indices = [i for i, m in enumerate(self.chunk_metadata) if m['namespace'] == ns]
+            self.ns_to_global_map[ns] = ns_global_indices
+
+            # 2. Build BM25 for this namespace
+            ns_chunks_tokenized = [self.chunks[i].lower().split() for i in ns_global_indices]
+            self.bm25_indices[ns] = BM25Okapi(ns_chunks_tokenized)
+
+            # 3. Build STAGE 1 (Pre-filtered) Vector Index for this namespace
+            ns_embeddings = np.array([all_embeddings[i] for i in ns_global_indices]).astype('float32')
+            dimension = ns_embeddings.shape[1]
+            index = faiss.IndexFlatL2(dimension)
+            index.add(ns_embeddings) # type: ignore
+            self.vector_indices[ns] = index
+
+        logger.info("Namespaced Intelligence indices finalized (Staged Hybrid Filtering Enabled).")
 
     def get_full_code_map(self) -> str:
         """Returns the high-level structure of all indexed code."""
@@ -142,50 +153,58 @@ class EphemeralFileIndex:
         return "\n".join(output)
 
     def search(self, query: str, namespace: Optional[str] = None, top_k: int = 8) -> List[str]:
-        """Hybrid search with optional Namespace filtering."""
-        if not self.chunks or self.vector_index is None:
+        """
+        Staged Hybrid Search:
+        Stage 1: Pre-filter by selecting the specific Namespace Index.
+        Stage 2: Perform Hybrid (Vector + BM25) search on the subset.
+        """
+        if not self.chunks:
             return []
 
-        # 1. Vector Search
-        query_vec = np.array(self.encoder.encode([query])).astype('float32')
-        # We search more than top_k to allow for namespace filtering
-        search_k = top_k * 5 if namespace else top_k * 2
-        distances, v_indices = self.vector_index.search(query_vec, search_k) # type: ignore
+        # Target specific namespaces or search all if none provided
+        target_namespaces = [namespace] if namespace else list(self.vector_indices.keys())
         
-        final_v_indices = []
-        for idx in v_indices[0]:
-            if idx == -1: continue
-            if namespace and self.chunk_metadata[idx]['namespace'] != namespace:
-                continue
-            final_v_indices.append(idx)
-            if len(final_v_indices) >= top_k: break
+        v_results_global_indices = []
+        b_results_global_indices = []
 
-        # 2. Namespace BM25 Search (if applicable)
-        final_b_indices = []
-        if namespace and namespace in self.bm25_indices:
-            tokenized_query = query.lower().split()
-            bm25 = self.bm25_indices[namespace]
-            scores = bm25.get_scores(tokenized_query)
-            # Map top scores back to original global indices
-            ns_global_map = [i for i, m in enumerate(self.chunk_metadata) if m['namespace'] == namespace]
-            top_ns_indices = np.argsort(scores)[-top_k:][::-1]
-            final_b_indices = [ns_global_map[i] for i in top_ns_indices if scores[i] > 0]
+        query_vec = np.array(self.encoder.encode([query])).astype('float32')
+        tokenized_query = query.lower().split()
 
-        # Consolidate results: Interleave BM25 and Vector to ensure variety
+        for ns in target_namespaces:
+            if ns not in self.vector_indices: continue
+
+            # STAGE 1 & 2: Vector Search on the Pre-filtered subset
+            ns_index = self.vector_indices[ns]
+            ns_map = self.ns_to_global_map[ns]
+            
+            distances, local_indices = ns_index.search(query_vec, top_k) # type: ignore
+            for loc_idx in local_indices[0]:
+                if loc_idx != -1:
+                    v_results_global_indices.append(ns_map[loc_idx])
+
+            # STAGE 2: BM25 Search on the same subset
+            if ns in self.bm25_indices:
+                scores = self.bm25_indices[ns].get_scores(tokenized_query)
+                top_loc_indices = np.argsort(scores)[-top_k:][::-1]
+                for loc_idx in top_loc_indices:
+                    if scores[loc_idx] > 0:
+                        b_results_global_indices.append(ns_map[loc_idx])
+
+        # Consolidate and Interleave (Hybrid Logic)
         combined_indices = []
         v_ptr, b_ptr = 0, 0
         seen = set()
 
-        while len(combined_indices) < top_k and (v_ptr < len(final_v_indices) or b_ptr < len(final_b_indices)):
-            if v_ptr < len(final_v_indices):
-                idx = final_v_indices[v_ptr]
+        while len(combined_indices) < top_k and (v_ptr < len(v_results_global_indices) or b_ptr < len(b_results_global_indices)):
+            if v_ptr < len(v_results_global_indices):
+                idx = v_results_global_indices[v_ptr]
                 if idx not in seen:
                     combined_indices.append(idx)
                     seen.add(idx)
                 v_ptr += 1
             
-            if len(combined_indices) < top_k and b_ptr < len(final_b_indices):
-                idx = final_b_indices[b_ptr]
+            if len(combined_indices) < top_k and b_ptr < len(b_results_global_indices):
+                idx = b_results_global_indices[b_ptr]
                 if idx not in seen:
                     combined_indices.append(idx)
                     seen.add(idx)
@@ -221,7 +240,6 @@ class FileProcessor:
 
     @staticmethod
     def process_zip(zip_path: str) -> List[Dict[str, str]]:
-        """Extracts ZIP and returns list of {'name': str, 'content': str, 'namespace': str}"""
         results = []
         temp_dir = tempfile.mkdtemp()
         try:
@@ -234,13 +252,11 @@ class FileProcessor:
                     rel_path = os.path.relpath(full_path, temp_dir)
                     ext = os.path.splitext(file)[1].lower()
                     
-                    # Ignore hidden/system files
                     if file.startswith('.') or '__pycache__' in root:
                         continue
 
                     content = FileProcessor.extract_content(full_path)
                     if content:
-                        # Auto-categorize
                         ns = "blueprint" if ext in [".py", ".js", ".ts", ".go", ".java", ".cpp", ".c", ".h"] else "vault"
                         results.append({
                             "name": rel_path,
