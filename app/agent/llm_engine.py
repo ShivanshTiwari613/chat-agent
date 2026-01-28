@@ -4,12 +4,13 @@ import asyncio
 import os
 import re
 import json
+import base64
 from typing import Any, AsyncGenerator, List, Dict, Union
 
 # Standard LangChain and Google GenAI imports
 from langchain_classic.agents.agent import AgentExecutor
 from langchain_classic.agents.tool_calling_agent.base import create_tool_calling_agent
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import StructuredTool
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
 
@@ -28,7 +29,7 @@ from config.settings import settings
 class AgentEngine:
     """
     Orchestrator for Staged Hybrid Filtering.
-    Features: Ultra-robust output normalization and execution safety.
+    Features: Multimodal indexing (Images + Text), ultra-robust output normalization.
     """
 
     def __init__(self, plan_id: str):
@@ -51,41 +52,80 @@ class AgentEngine:
 
         self.agent_executor: AgentExecutor | None = None
 
+    async def _describe_image(self, image_bytes: bytes, filename: str) -> str:
+        """Uses Gemini Vision to generate a searchable description of an image."""
+        try:
+            b64_image = base64.b64encode(image_bytes).decode("utf-8")
+            message = HumanMessage(
+                content=[
+                    {"type": "text", "text": f"Provide a comprehensive and detailed description of this image (Filename: {filename}) for a search index. Include text found in the image, objects, colors, and overall context."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
+                ]
+            )
+            response = await self.llm.ainvoke([message])
+            return str(response.content)
+        except Exception as e:
+            logger.error(f"Image analysis failed for {filename}: {e}")
+            return f"An image named {filename} (Description failed)."
+
     async def add_files(self, file_paths: List[str]):
-        """Ingests files into the Staged Intelligence Engine."""
+        """Ingests files into the Staged Intelligence Engine, including Image analysis."""
         all_items_to_index = []
+        
         for path in file_paths:
             if not os.path.exists(path): continue
             filename = os.path.basename(path)
             ext = os.path.splitext(filename)[1].lower()
 
+            extracted_items = []
             if ext == ".zip":
-                extracted = await asyncio.to_thread(FileProcessor.process_zip, path)
-                all_items_to_index.extend(extracted)
-            elif ext in [".csv", ".xlsx", ".xls", ".json"]:
-                await self.sandbox_handler.ensure_running()
-                with open(path, "rb") as f:
-                    content = f.read()
-                    sb = self.sandbox_handler.sandbox
-                    if sb: await asyncio.to_thread(sb.files.write, filename, content)
+                extracted_items = await asyncio.to_thread(FileProcessor.process_zip, path)
             else:
-                content = await asyncio.to_thread(FileProcessor.extract_content, path)
-                if content:
-                    ns = "blueprint" if ext in [".py", ".js", ".ts", ".go", ".java", ".cpp", ".c", ".h"] else "vault"
-                    all_items_to_index.append({"name": filename, "content": content, "namespace": ns})
+                content_data = await asyncio.to_thread(FileProcessor.extract_content, path)
+                ns = "blueprint" if ext in [".py", ".js", ".ts", ".go", ".java", ".cpp", ".c", ".h"] else "vault"
+                extracted_items.append({
+                    "name": filename,
+                    "text": content_data["text"],
+                    "images": content_data["images"],
+                    "namespace": ns
+                })
 
-        for item in all_items_to_index:
-            self.file_index.add_text(item["content"], item["name"], namespace=item["namespace"])
-            if item["namespace"] == "blueprint":
-                self.file_index.add_code_structure(item["name"], item["content"])
-            
-            await self.sandbox_handler.ensure_running()
-            sb = self.sandbox_handler.sandbox
-            if sb:
-                safe_name = item["name"].replace("/", "_").replace("\\", "_")
-                if not safe_name.lower().endswith(".txt"):
-                    safe_name = f"{os.path.splitext(safe_name)[0]}.txt"
-                await asyncio.to_thread(sb.files.write, safe_name, item["content"])
+            for item in extracted_items:
+                # 1. Process Text Content
+                if item["text"]:
+                    self.file_index.add_text(item["text"], item["name"], namespace=item["namespace"])
+                    if item["namespace"] == "blueprint":
+                        self.file_index.add_code_structure(item["name"], item["text"])
+                    
+                    # Mirror text to sandbox
+                    await self.sandbox_handler.ensure_running()
+                    sb = self.sandbox_handler.sandbox
+                    if sb:
+                        safe_name = item["name"].replace("/", "_").replace("\\", "_")
+                        if not any(safe_name.lower().endswith(e) for e in [".txt", ".py", ".js", ".json", ".md"]):
+                            safe_name = f"{os.path.splitext(safe_name)[0]}.txt"
+                        await asyncio.to_thread(sb.files.write, safe_name, item["text"])
+
+                # 2. Process Visual Content (Multimodal Indexing)
+                for img_data in item.get("images", []):
+                    img_name = img_data["name"]
+                    img_bytes = img_data["content"]
+                    
+                    logger.info(f"Analyzing visual content: {img_name}")
+                    description = await self._describe_image(img_bytes, img_name)
+                    
+                    # Add visual description to the 'gallery' namespace
+                    self.file_index.add_text(
+                        f"IMAGE DESCRIPTION for {img_name}:\n{description}", 
+                        img_name, 
+                        namespace="gallery"
+                    )
+                    
+                    # Upload raw image to sandbox for agent visibility/processing
+                    await self.sandbox_handler.ensure_running()
+                    sb = self.sandbox_handler.sandbox
+                    if sb:
+                        await asyncio.to_thread(sb.files.write, img_name, img_bytes)
 
         if self.file_index.chunks:
             await asyncio.to_thread(self.file_index.finalize)
@@ -115,54 +155,31 @@ class AgentEngine:
         )
 
     def _normalize_output(self, value: Any) -> str:
-        """
-        Hyper-robust normalization.
-        Extracts clean text from complex JSON objects, lists, and signature blocks.
-        """
+        """Hyper-robust normalization for complex tool outputs."""
         if not value: return ""
+        if hasattr(value, "output_text"): return str(value.output_text).strip()
         
-        # 1. Handle tool result objects
-        if hasattr(value, "output_text"):
-            return str(value.output_text).strip()
-        
-        # 2. Handle Dictionary results
         if isinstance(value, dict):
-            # Check for standard content keys first
             for key in ["text", "output_text", "output", "content"]:
-                if key in value and value[key]:
-                    return self._normalize_output(value[key])
-            # If no clear text key, check if it's a list under 'content'
-            if "content" in value and isinstance(value["content"], list):
-                return self._normalize_output(value["content"])
+                if key in value and value[key]: return self._normalize_output(value[key])
             return json.dumps(value)
 
-        # 3. Handle Lists
         if isinstance(value, list):
             return "\n".join([self._normalize_output(v) for v in value if v]).strip()
 
-        # 4. Handle Strings & JSON-Strings
         if isinstance(value, str):
             val = value.strip()
-            
-            # If string looks like JSON, try to parse it
             if (val.startswith("{") and val.endswith("}")) or (val.startswith("[") and val.endswith("]")):
                 try:
-                    # Cleanup common encoding errors before parse
-                    clean_json = val.replace('\\"', '"').replace('\\n', '\n')
-                    data = json.loads(clean_json)
+                    data = json.loads(val.replace('\\"', '"').replace('\\n', '\n'))
                     return self._normalize_output(data)
                 except: pass
             
-            # Aggressively strip technical noise via Regex
             val = re.sub(r'["\']extras["\']:\s*\{.*?\}', "", val, flags=re.DOTALL)
             val = re.sub(r'["\']signature["\']:\s*["\'].*?["\']', "", val, flags=re.DOTALL)
-            val = re.sub(r'["\']type["\']:\s*["\']text["\']', "", val)
-            
-            # Final bracket/key cleanup
             val = val.lstrip('{').rstrip('}').strip()
             if '"text":' in val:
                 val = val.split('"text":', 1)[1].strip().lstrip('"').rsplit('"', 1)[0]
-            
             return val.strip()
 
         return str(value).strip()
@@ -192,13 +209,12 @@ class AgentEngine:
             ):
                 if "actions" in chunk:
                     for action in chunk["actions"]:
-                        yield AgentEvent(type="tool", label="TOOL", details=f"Searching {action.tool}...")
+                        yield AgentEvent(type="tool", label="TOOL", details=f"Using {action.tool}...")
                 elif "output" in chunk:
                     final_output_captured = self._normalize_output(chunk["output"])
                     if final_output_captured:
                         yield AgentEvent(type="result", label="ANSWER", details=final_output_captured)
 
-            # CRITICAL FALLBACK: If stream provided no result or malformed JSON
             if not final_output_captured:
                 result = await self.agent_executor.ainvoke({"input": contextual_input, "chat_history": chat_history})
                 final_output_captured = self._normalize_output(result.get("output", ""))
