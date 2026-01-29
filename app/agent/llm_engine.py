@@ -5,17 +5,18 @@ import os
 import re
 import json
 import base64
+import uuid
 from typing import Any, AsyncGenerator, List, Dict, Union
 
 # Standard LangChain and Google GenAI imports
 from langchain_classic.agents.agent import AgentExecutor
 from langchain_classic.agents.tool_calling_agent.base import create_tool_calling_agent
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_core.tools import StructuredTool
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
 
 from app.agent.prompt import get_agent_prompt
-from app.api.schema import AgentEvent
+from app.api.schema import AgentEvent, SourceMetadata
 from app.sandbox.e2b_handler import E2BSandbox
 from app.tool.coding_tool import CodingTool
 from app.tool.searching_tool import SearchingTool
@@ -29,13 +30,16 @@ from config.settings import settings
 class AgentEngine:
     """
     Orchestrator for Staged Hybrid Filtering.
-    Features: Multimodal indexing (Images + Text), ultra-robust output normalization.
+    Features: Multimodal indexing, UI-centric event streaming, and session-state memory.
     """
 
     def __init__(self, plan_id: str):
         self.plan_id = plan_id
         self.sandbox_handler = E2BSandbox(plan_id=plan_id, timeout=1800)
         self.file_index = EphemeralFileIndex()
+        
+        # Internal Session Memory: Persists for the life of the AgentEngine instance
+        self.internal_history: List[BaseMessage] = []
 
         self.llm = ChatGoogleGenerativeAI(
             model=settings.GEMINI_MODEL_NAME,
@@ -69,9 +73,8 @@ class AgentEngine:
             return f"An image named {filename} (Description failed)."
 
     async def add_files(self, file_paths: List[str]):
-        """Ingests files into the Staged Intelligence Engine, including Image analysis."""
+        """Ingests files, handles image analysis, and mirrors content to the sandbox."""
         all_items_to_index = []
-        
         for path in file_paths:
             if not os.path.exists(path): continue
             filename = os.path.basename(path)
@@ -91,13 +94,11 @@ class AgentEngine:
                 })
 
             for item in extracted_items:
-                # 1. Process Text Content
                 if item["text"]:
                     self.file_index.add_text(item["text"], item["name"], namespace=item["namespace"])
                     if item["namespace"] == "blueprint":
                         self.file_index.add_code_structure(item["name"], item["text"])
                     
-                    # Mirror text to sandbox
                     await self.sandbox_handler.ensure_running()
                     sb = self.sandbox_handler.sandbox
                     if sb:
@@ -106,26 +107,14 @@ class AgentEngine:
                             safe_name = f"{os.path.splitext(safe_name)[0]}.txt"
                         await asyncio.to_thread(sb.files.write, safe_name, item["text"])
 
-                # 2. Process Visual Content (Multimodal Indexing)
                 for img_data in item.get("images", []):
                     img_name = img_data["name"]
-                    img_bytes = img_data["content"]
-                    
-                    logger.info(f"Analyzing visual content: {img_name}")
-                    description = await self._describe_image(img_bytes, img_name)
-                    
-                    # Add visual description to the 'gallery' namespace
-                    self.file_index.add_text(
-                        f"IMAGE DESCRIPTION for {img_name}:\n{description}", 
-                        img_name, 
-                        namespace="gallery"
-                    )
-                    
-                    # Upload raw image to sandbox for agent visibility/processing
+                    description = await self._describe_image(img_data["content"], img_name)
+                    self.file_index.add_text(f"IMAGE DESCRIPTION for {img_name}:\n{description}", img_name, namespace="gallery")
                     await self.sandbox_handler.ensure_running()
                     sb = self.sandbox_handler.sandbox
                     if sb:
-                        await asyncio.to_thread(sb.files.write, img_name, img_bytes)
+                        await asyncio.to_thread(sb.files.write, img_name, img_data["content"])
 
         if self.file_index.chunks:
             await asyncio.to_thread(self.file_index.finalize)
@@ -155,18 +144,15 @@ class AgentEngine:
         )
 
     def _normalize_output(self, value: Any) -> str:
-        """Hyper-robust normalization for complex tool outputs."""
+        """Hyper-robust normalization logic."""
         if not value: return ""
         if hasattr(value, "output_text"): return str(value.output_text).strip()
-        
         if isinstance(value, dict):
             for key in ["text", "output_text", "output", "content"]:
                 if key in value and value[key]: return self._normalize_output(value[key])
             return json.dumps(value)
-
         if isinstance(value, list):
             return "\n".join([self._normalize_output(v) for v in value if v]).strip()
-
         if isinstance(value, str):
             val = value.strip()
             if (val.startswith("{") and val.endswith("}")) or (val.startswith("[") and val.endswith("]")):
@@ -174,14 +160,12 @@ class AgentEngine:
                     data = json.loads(val.replace('\\"', '"').replace('\\n', '\n'))
                     return self._normalize_output(data)
                 except: pass
-            
             val = re.sub(r'["\']extras["\']:\s*\{.*?\}', "", val, flags=re.DOTALL)
             val = re.sub(r'["\']signature["\']:\s*["\'].*?["\']', "", val, flags=re.DOTALL)
             val = val.lstrip('{').rstrip('}').strip()
             if '"text":' in val:
                 val = val.split('"text":', 1)[1].strip().lstrip('"').rsplit('"', 1)[0]
             return val.strip()
-
         return str(value).strip()
 
     async def chat(
@@ -189,40 +173,71 @@ class AgentEngine:
     ) -> AsyncGenerator[AgentEvent, None]:
         if not self.agent_executor: raise RuntimeError("Agent not initialized.")
 
+        # 1. Sync internal history with provided history if internal is empty
+        if not self.internal_history and chat_history:
+            self.internal_history = chat_history
+
+        # 2. Add current user message to internal context
+        self.internal_history.append(HumanMessage(content=user_input))
+
+        # Build context for prompt (file metadata)
         namespaces = {}
         for m in self.file_index.chunk_metadata:
             ns = m['namespace']
             if ns not in namespaces: namespaces[ns] = set()
             namespaces[ns].add(m['source'])
+        contextual_input = f"{user_input}\n\n[INTELLIGENCE POOLS]: " + ", ".join([f"{k.upper()}: {list(v)}" for k, v in namespaces.items()])
 
-        context_parts = ["\n\n[INTELLIGENCE POOLS]:"]
-        for ns, files in namespaces.items():
-            context_parts.append(f"- {ns.upper()}: {', '.join(files)}")
-        
-        contextual_input = f"{user_input}{''.join(context_parts)}"
-        yield AgentEvent(type="status", label="START", details="Thinking...")
+        yield AgentEvent(type="status", label="THINKING", details="Analyzing your request...")
 
         final_output_captured: str = ""
         try:
             async for chunk in self.agent_executor.astream(
-                {"input": contextual_input, "chat_history": chat_history}
+                {"input": contextual_input, "chat_history": self.internal_history[:-1]} # Use history up to current msg
             ):
                 if "actions" in chunk:
                     for action in chunk["actions"]:
-                        yield AgentEvent(type="tool", label="TOOL", details=f"Using {action.tool}...")
+                        step_id = str(uuid.uuid4())[:8]
+                        label = action.tool.replace("_", " ").upper()
+                        yield AgentEvent(
+                            type="tool_start", 
+                            label=label, 
+                            details=f"Executing {action.tool} with input: {action.tool_input}",
+                            tool_name=action.tool,
+                            step_id=step_id
+                        )
+
+                elif "steps" in chunk:
+                    for step in chunk["steps"]:
+                        observation = step.observation
+                        if hasattr(observation, "output_data") and observation.output_data:
+                            sources = observation.output_data.get("sources", [])
+                            if sources:
+                                ui_sources = [SourceMetadata(**s) for s in sources]
+                                yield AgentEvent(
+                                    type="source_found",
+                                    label="SOURCES FOUND",
+                                    details=f"Discovered {len(ui_sources)} relevant websites.",
+                                    sources=ui_sources
+                                )
+
                 elif "output" in chunk:
                     final_output_captured = self._normalize_output(chunk["output"])
                     if final_output_captured:
-                        yield AgentEvent(type="result", label="ANSWER", details=final_output_captured)
+                        # 3. Save AI response to memory
+                        self.internal_history.append(AIMessage(content=final_output_captured))
+                        yield AgentEvent(type="result", content=final_output_captured)
 
+            # Fallback if streaming fails to capture final output
             if not final_output_captured:
-                result = await self.agent_executor.ainvoke({"input": contextual_input, "chat_history": chat_history})
+                result = await self.agent_executor.ainvoke({"input": contextual_input, "chat_history": self.internal_history[:-1]})
                 final_output_captured = self._normalize_output(result.get("output", ""))
-                yield AgentEvent(type="result", label="ANSWER", details=final_output_captured or "Analysis complete.")
+                self.internal_history.append(AIMessage(content=final_output_captured or "Task completed."))
+                yield AgentEvent(type="result", content=final_output_captured or "Task completed.")
 
         except Exception as e:
             logger.error(f"Chat error: {e}", exc_info=True)
-            yield AgentEvent(type="error", label="ERROR", details=str(e))
+            yield AgentEvent(type="error", details=str(e))
 
     async def cleanup(self):
         if self.sandbox_handler: self.sandbox_handler.close()

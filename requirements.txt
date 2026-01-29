@@ -17,3 +17,5 @@ sentence-transformers
 faiss-cpu
 tree-sitter==0.20.4
 tree-sitter-languages==1.10.2
+flask 
+flask-cors

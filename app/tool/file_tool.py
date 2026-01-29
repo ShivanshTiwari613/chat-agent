@@ -2,6 +2,7 @@
 
 from typing import Any, Dict, List, Type, Optional
 from pydantic import BaseModel, Field, PrivateAttr
+# Note: In a real environment, you'd ensure EphemeralFileIndex is imported correctly
 from app.tool.base import BaseTool, ToolResult
 from app.utils.file_processor import EphemeralFileIndex
 
@@ -10,6 +11,10 @@ class FileAnalysisArgs(BaseModel):
     namespace: Optional[str] = Field(
         None, 
         description="CRITICAL: Filter search by category: 'vault' (docs/PDFs), 'blueprint' (code), or 'lab' (web research). If omitted, searches all namespaces."
+    )
+    source_file: Optional[str] = Field(
+        None,
+        description="Optional: Filter search to a specific filename (e.g., 'research_topic_123.txt'). Use this to prevent data mixing if multiple research files exist."
     )
     request_type: str = Field(
         "search", 
@@ -23,7 +28,7 @@ class FileAnalysisArgs(BaseModel):
 class FileIntelligenceTool(BaseTool):
     """
     Namespaced Intelligence Engine: Implements Staged Hybrid Filtering.
-    Stage 1: Pre-filters by Namespace (Vault/Blueprint/Lab) to eliminate noise.
+    Stage 1: Pre-filters by Namespace or specific Source File to eliminate noise.
     Stage 2: Executes Hybrid Vector + BM25 search on the filtered subset.
     """
     name: str = "analyze_documents_and_code"
@@ -33,8 +38,7 @@ class FileIntelligenceTool(BaseTool):
         "2. 'blueprint': Use for code logic, signatures, and project structure. "
         "3. 'lab': Use for raw research data gathered from the web. "
         "4. 'map': Use with request_type='map' to see the high-level codebase skeleton. "
-        "Note: If semantic search fails to find a specific string, use 'run_python_code' "
-        "for a deterministic Precision Search (grep/regex) in the sandbox."
+        "Note: You can use 'source_file' to target a specific research file and avoid mixing data."
     )
     args_schema: Type[BaseModel] = FileAnalysisArgs
     _index: EphemeralFileIndex = PrivateAttr()
@@ -48,6 +52,7 @@ class FileIntelligenceTool(BaseTool):
         request_type: str = "search", 
         query: Optional[str] = None, 
         namespace: Optional[str] = None, 
+        source_file: Optional[str] = None,
         top_k: int = 8,
         **kwargs
     ) -> ToolResult:
@@ -74,16 +79,22 @@ class FileIntelligenceTool(BaseTool):
             )
 
         # Execute search through the updated EphemeralFileIndex
-        # This now uses the Stage 1 (Pre-filtering) and Stage 2 (Hybrid Ranking) logic
+        # Pass the source_file as source_filter to ensure data distinction
         results = await asyncio.to_thread(
             self._index.search, 
             query, 
             namespace=namespace, 
+            source_filter=source_file,
             top_k=top_k
         )
         
         if not results:
-            ns_msg = f" in the '{namespace}' pool" if namespace else ""
+            filter_msg = []
+            if namespace: filter_msg.append(f"in the '{namespace}' pool")
+            if source_file: filter_msg.append(f"within the file '{source_file}'")
+            
+            ns_msg = " " + " and ".join(filter_msg) if filter_msg else ""
+            
             return ToolResult(
                 success=False, 
                 output_text=(
@@ -94,7 +105,11 @@ class FileIntelligenceTool(BaseTool):
                 )
             )
         
-        header = f"STAGED SEARCH RESULTS ({namespace.upper() if namespace else 'GLOBAL INDEX'}):\n\n"
+        header = f"STAGED SEARCH RESULTS ({namespace.upper() if namespace else 'GLOBAL INDEX'}):\n"
+        if source_file:
+            header += f"FILTERED BY SOURCE: {source_file}\n"
+        header += "\n"
+        
         return ToolResult(
             success=True, 
             output_text=header + "\n---\n".join(results)

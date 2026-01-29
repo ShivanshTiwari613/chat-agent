@@ -39,3 +39,5 @@ Thumbs.db
 # Tooling
 .ipynb_checkpoints/
 .env
+
+image.png

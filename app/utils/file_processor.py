@@ -21,7 +21,7 @@ class EphemeralFileIndex:
         self.encoder = SentenceTransformer('all-mpnet-base-v2')
         self.chunks: List[str] = []
         
-        # Enhanced metadata to support Namespacing
+        # Enhanced metadata to support Namespacing and Source tracking
         self.chunk_metadata: List[Dict[str, Any]] = []
         
         # High-level structural maps for code (blueprint)
@@ -76,7 +76,7 @@ class EphemeralFileIndex:
             logger.warning(f"Tree-sitter error for {filename}: {e}")
 
     def add_text(self, text: str, source_name: str, namespace: str = "vault"):
-        """Splits text into chunks and assigns to a specific Namespace."""
+        """Splits text into chunks and assigns to a specific Namespace and Source."""
         if not text: return
         text = text.replace('\x00', '') 
         words = text.split()
@@ -126,6 +126,7 @@ class EphemeralFileIndex:
             ns_embeddings = np.array([all_embeddings[i] for i in ns_global_indices]).astype('float32')
             dimension = ns_embeddings.shape[1]
             index = faiss.IndexFlatL2(dimension)
+            # type: ignore added to handle Faiss SWIG bindings
             index.add(ns_embeddings) # type: ignore
             self.vector_indices[ns] = index
 
@@ -141,7 +142,11 @@ class EphemeralFileIndex:
                 output.append(f"  - {s}")
         return "\n".join(output)
 
-    def search(self, query: str, namespace: Optional[str] = None, top_k: int = 8) -> List[str]:
+    def search(self, query: str, namespace: Optional[str] = None, source_filter: Optional[str] = None, top_k: int = 8) -> List[str]:
+        """
+        Performs search with support for Namespace and Source (Filename) filtering.
+        Corrected Pylance issue with FAISS search signature.
+        """
         if not self.chunks: return []
 
         target_namespaces = [namespace] if namespace else list(self.vector_indices.keys())
@@ -156,16 +161,30 @@ class EphemeralFileIndex:
             ns_index = self.vector_indices[ns]
             ns_map = self.ns_to_global_map[ns]
             
-            distances, local_indices = ns_index.search(query_vec, top_k) # type: ignore
+            # Apply Vector Search
+            # We cast ns_index to Any to resolve the Pylance/FAISS signature mismatch issue
+            distances, local_indices = cast(Any, ns_index).search(query_vec, top_k * 2) 
+            
             for loc_idx in local_indices[0]:
-                if loc_idx != -1: v_results_global_indices.append(ns_map[loc_idx])
+                if loc_idx != -1:
+                    global_idx = ns_map[loc_idx]
+                    # If source_filter is provided, skip chunks that don't match the filename
+                    if source_filter and self.chunk_metadata[global_idx]['source'] != source_filter:
+                        continue
+                    v_results_global_indices.append(global_idx)
 
+            # Apply Keyword Search
             if ns in self.bm25_indices:
                 scores = self.bm25_indices[ns].get_scores(tokenized_query)
-                top_loc_indices = np.argsort(scores)[-top_k:][::-1]
+                top_loc_indices = np.argsort(scores)[-top_k*2:][::-1]
                 for loc_idx in top_loc_indices:
-                    if scores[loc_idx] > 0: b_results_global_indices.append(ns_map[loc_idx])
+                    if scores[loc_idx] > 0:
+                        global_idx = ns_map[loc_idx]
+                        if source_filter and self.chunk_metadata[global_idx]['source'] != source_filter:
+                            continue
+                        b_results_global_indices.append(global_idx)
 
+        # Interleave results (Hybrid Reranking)
         combined_indices = []
         v_ptr, b_ptr = 0, 0
         seen = set()
