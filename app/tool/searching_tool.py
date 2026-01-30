@@ -4,6 +4,7 @@ import asyncio
 import uuid
 import time
 import re
+import os
 from functools import partial
 from typing import Any, Dict, List, Optional, Union, Type
 
@@ -14,7 +15,11 @@ from app.tool.base import BaseTool, ToolResult
 from app.sandbox.e2b_handler import E2BSandbox
 from app.utils.file_processor import EphemeralFileIndex
 from app.utils.logger import logger
+from app.utils.database import SessionLocal, FileRegistryRecord
 from config.settings import settings
+
+# Constant for persistent disk storage
+STORAGE_BASE = "persistent_storage"
 
 # ---------------------------------------------------------------------------
 # Tool Schema
@@ -105,11 +110,12 @@ class SearchingTool(BaseTool):
         if not self._tavily:
             return ToolResult(success=False, output_text="Tavily API key missing.")
 
+        # Identify the current plan_id (context passed via kwargs from AgentEngine)
+        plan_id = getattr(self._sandbox_handler, "plan_id", "unknown")
         search_queries = [query] if isinstance(query, str) else query
         
-        # 1. Generate a unique filename for this research session to prevent data mixing
+        # 1. Generate a unique filename for this research session
         search_id = str(uuid.uuid4())[:8]
-        # Create a clean string from the query for the filename
         base_query = search_queries[0] if isinstance(search_queries[0], str) else "research"
         clean_query_name = re.sub(r'[^\w\s-]', '', base_query[:20]).strip().replace(' ', '_')
         research_filename = f"research_{clean_query_name}_{search_id}.txt"
@@ -122,7 +128,7 @@ class SearchingTool(BaseTool):
         urls_to_crawl = list({url for url in (r.get("url") for r in all_results) if isinstance(url, str)})
 
         all_research_data = []
-        ui_sources = [] # Structured for UI cards
+        ui_sources = [] 
         crawled_content_map = {}
 
         # 3. Depth Crawling
@@ -160,15 +166,30 @@ class SearchingTool(BaseTool):
 
         combined_data = "\n\n".join(all_research_data)
 
-        # 5. Integrate into Namespaced Index (The 'Lab') using the unique filename
+        # 5. INTEGRATION: Persistence to Disk and NeonDB
         try:
+            # Save to local persistent disk
+            session_storage_path = os.path.join(STORAGE_BASE, plan_id)
+            os.makedirs(session_storage_path, exist_ok=True)
+            full_local_path = os.path.join(session_storage_path, research_filename)
+            
+            with open(full_local_path, "w", encoding="utf-8") as f:
+                f.write(combined_data)
+
+            # Register in NeonDB
+            db = SessionLocal()
+            db.add(FileRegistryRecord(plan_id=plan_id, filename=research_filename, namespace="lab"))
+            db.commit()
+            db.close()
+            
+            # Update current in-memory index
             if self._file_index:
                 self._file_index.add_text(combined_data, research_filename, namespace="lab")
                 await asyncio.to_thread(self._file_index.finalize)
         except Exception as e:
-            logger.warning(f"Failed to index search results in Lab: {e}")
+            logger.warning(f"Failed to persist research results: {e}")
 
-        # 6. Save to Sandbox Mirror using the unique filename
+        # 6. Save to Sandbox Mirror
         try:
             await self._sandbox_handler.ensure_running()
             sb = self._sandbox_handler.sandbox
