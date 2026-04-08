@@ -21,10 +21,6 @@ from config.settings import settings
 # Constant for persistent disk storage
 STORAGE_BASE = "persistent_storage"
 
-# ---------------------------------------------------------------------------
-# Tool Schema
-# ---------------------------------------------------------------------------
-
 class SearchArguments(BaseModel):
     """Schema for the search_and_crawl_web tool."""
     query: Union[str, List[str]] = Field(

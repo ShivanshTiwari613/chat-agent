@@ -27,10 +27,6 @@ class E2BSandbox:
 
         logger.info(f"[{self.plan_id}] Initializing E2BSandbox with {timeout}s timeout.")
 
-    # ------------------------------------------------------------------
-    # Sandbox Creation
-    # ------------------------------------------------------------------
-
     def _create_sandbox_sync(self) -> Sandbox:
         """Synchronous sandbox creation via E2B SDK."""
         template = settings.E2B_TEMPLATE_ID or "base"
@@ -51,10 +47,6 @@ class E2BSandbox:
         logger.info(f"[{self.plan_id}] Sandbox VM created with ID: {sandbox_id}")
 
         return sandbox
-
-    # ------------------------------------------------------------------
-    # Health Check with Retries (Fixes the 502 Error)
-    # ------------------------------------------------------------------
 
     async def _check_ready(self) -> bool:
         """
@@ -88,10 +80,6 @@ class E2BSandbox:
         
         logger.error(f"[{self.plan_id}] Sandbox failed to become ready after {max_retries} attempts.")
         return False
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     async def start(self) -> bool:
         """Start sandbox and verify readiness."""
@@ -148,10 +136,6 @@ class E2BSandbox:
             self._cleanup_sandbox_internal()
             return await self.start()
 
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
-
     def _cleanup_sandbox_internal(self) -> None:
         """Internal cleanup logic."""
         self._is_ready = False
@@ -171,10 +155,6 @@ class E2BSandbox:
         self._cleanup_sandbox_internal()
         logger.info(f"[{self.plan_id}] Sandbox closed.")
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-
     @property
     def sandbox(self) -> Optional[Sandbox]:
         return self._sandbox
@@ -183,10 +163,6 @@ class E2BSandbox:
     def is_running(self) -> bool:
         return self._sandbox is not None and self._is_ready
 
-
-# =============================================================================
-# Global Singleton Manager
-# =============================================================================
 
 class GlobalSandboxManager:
     """Singleton manager for the global server lifecycle."""
