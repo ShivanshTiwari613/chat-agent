@@ -37,10 +37,6 @@ class SearchArguments(BaseModel):
         description="If True, extracts the full content of the found web pages instead of just snippets."
     )
 
-# ---------------------------------------------------------------------------
-# Main Tool
-# ---------------------------------------------------------------------------
-
 class SearchingTool(BaseTool):
     """
     Extensive Web Crawler tool. Gathers deep content from the web and 
